@@ -126,7 +126,7 @@ class SeleniumRangeCryptoDataScraper:
             logger.error(f"El archivo {self.crypto_file} no tiene un formato JSON válido")
             return []
     
-    def group_dates_into_ranges(self, dates: List[str], range_days: int = 5) -> List[Tuple[str, str]]:
+    def group_dates_into_ranges(self, dates: List[str], range_days: int = 30) -> List[Tuple[str, str]]:
         """Agrupa fechas en rangos de N días"""
         if not dates:
             return []
@@ -474,8 +474,8 @@ class SeleniumRangeCryptoDataScraper:
             return {'symbol': symbol, 'success': 0, 'failed': 0, 'skipped': len(available_dates)}
         
         # Agrupar fechas en rangos de 5 días
-        date_ranges = self.group_dates_into_ranges(pending_dates, 5)
-        logger.info(f"📦 Agrupado en {len(date_ranges)} rangos de hasta 5 días cada uno")
+        date_ranges = self.group_dates_into_ranges(pending_dates, 30)
+        logger.info(f"📦 Agrupado en {len(date_ranges)} rangos de hasta 30 días cada uno")
         
         success_count = 0
         failed_count = 0
