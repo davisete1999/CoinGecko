@@ -2,3 +2,6 @@ coingecko/
 daily_data/
 values/
 criptomonedas.json
+coingecko_historical.log
+coingecko_range_scraper.log
+coingecko_scraper.log

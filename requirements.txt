@@ -1,2 +1,12 @@
-selenium>=4.0.0
-pandas>=1.5.0
+requests
+psycopg2-binary
+influxdb
+python-dotenv
+influxdb_client
+grpcio
+grpcio-tools
+selenium
+pandas
+webdriver-manager
+protobuf
+pydantic
