@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Script para obtener datos históricos de precios y capitalización de mercado de criptomonedas 
-desde CoinGecko usando Selenium. Usa el esquema normalizado de PostgreSQL con tablas separadas
-por fuente y guarda los datos históricos en InfluxDB.
+Script para descargar datos de criptomonedas en rangos de días desde CoinGecko usando Selenium
+Adaptado al esquema normalizado de PostgreSQL con lógica de datos históricos hacia atrás
+SOLO BASE DE DATOS - Sin archivos CSV/JSON
 
-ARREGLADO: Error de símbolos duplicados en update_coingecko_scraping_progress
-ARREGLADO: Error de conversión int() con valores None - manejo robusto de datos faltantes
+VERSIÓN NORMALIZADA COHERENTE:
+- Misma lógica que SeleniumCryptoDataScraper
+- Datos históricos hacia atrás desde oldest_data_fetched
+- Solo PostgreSQL e InfluxDB (sin archivos)
+- Compatible con InfluxDB 1.x y 2.x
 """
 
 import json
@@ -13,9 +16,8 @@ import os
 import time
 import random
 import logging
-from urllib.parse import urlparse
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone, date
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Set, Optional, Tuple
 from dataclasses import dataclass
 
 from selenium import webdriver
@@ -39,7 +41,7 @@ logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('coingecko_historical.log'),
+        logging.FileHandler('coingecko_range_scraper_normalized.log'),
         logging.StreamHandler()
     ]
 )
@@ -72,28 +74,20 @@ def load_env_file(env_file: str = '.env'):
 class InfluxDBConfig:
     """Configuración de InfluxDB desde variables de entorno"""
     host: str = os.getenv('INFLUXDB_HOST', 'localhost')
-    port: int = int(os.getenv('INFLUXDB_EXTERNAL_PORT') or '8086')  # ARREGLADO: Manejar None
-    database: str = os.getenv('INFLUXDB_DB', 'crypto_historical')
-    token: str = os.getenv('INFLUXDB_TOKEN', '0_aEXpz0v0Nhbw-fHpaarS4IEcrktOJjSGFpG9SLMh3tijC8QDyI9ahXfmNnBtQ1sSnIIlGMYqJCo3A6rtF9NQ==')
+    port: int = int(os.getenv('INFLUXDB_EXTERNAL_PORT') or '8086')
+    database: str = os.getenv('INFLUXDB_DB', 'quotes')
+    token: str = os.getenv('INFLUXDB_TOKEN', '')
     org: str = os.getenv('INFLUXDB_ORG', 'CoinAdvisor')
     
     def __post_init__(self):
         """Validar configuración después de inicialización"""
-        if not self.token:
-            logger.error("❌ INFLUXDB_TOKEN está vacío")
-            raise ValueError("INFLUXDB_TOKEN is required for InfluxDB v2")
-        
-        if not self.org:
-            logger.error("❌ INFLUXDB_ORG está vacío")
-            raise ValueError("INFLUXDB_ORG is required for InfluxDB v2")
-        
         logger.info(f"🔧 InfluxDB Config: {self.host}:{self.port} | org='{self.org}', bucket='{self.database}'")
 
 @dataclass
 class PostgreSQLConfig:
     """Configuración de PostgreSQL desde variables de entorno"""
     host: str = os.getenv('POSTGRES_HOST', 'localhost')
-    port: int = int(os.getenv('POSTGRES_EXTERNAL_PORT') or '5432')  # ARREGLADO: Manejar None
+    port: int = int(os.getenv('POSTGRES_EXTERNAL_PORT') or '5432')
     database: str = os.getenv('POSTGRES_DB', 'cryptodb')
     user: str = os.getenv('POSTGRES_USER', 'crypto-user')
     password: str = os.getenv('POSTGRES_PASSWORD', 'davisete453')
@@ -103,7 +97,7 @@ class PostgreSQLConfig:
         logger.info(f"🔧 PostgreSQL Config: {self.host}:{self.port}/{self.database}")
 
 class PostgreSQLManager:
-    """Manejador de PostgreSQL con esquema normalizado por fuentes"""
+    """Manejador de PostgreSQL con esquema normalizado para rangos"""
     
     def __init__(self, config: PostgreSQLConfig):
         self.config = config
@@ -138,15 +132,15 @@ class PostgreSQLManager:
             logger.error(f"❌ Error conectando a PostgreSQL: {e}")
             return False
     
-    def get_coingecko_cryptocurrencies_with_priority(self, limit: Optional[int] = None) -> List[Dict]:
-        """Obtiene criptomonedas de CoinGecko con priorización inteligente usando esquema normalizado"""
+    def get_coingecko_cryptocurrencies_for_ranges(self, limit: Optional[int] = None) -> List[Dict]:
+        """Obtiene criptomonedas CoinGecko con priorización para rangos (COHERENTE con datos históricos hacia atrás)"""
         if not self.connection:
             logger.error("❌ No hay conexión a PostgreSQL")
             return []
         
         try:
             with self.connection.cursor() as cursor:
-                # Consulta usando esquema normalizado con vista y joins
+                # Consulta coherente con SeleniumCryptoDataScraper usando oldest_data_fetched
                 sql = """
                 SELECT 
                     c.id as crypto_id,
@@ -156,7 +150,6 @@ class PostgreSQLManager:
                     c.is_active,
                     
                     -- Datos específicos de CoinGecko
-                    cg.id as coingecko_id,
                     cg.coingecko_rank,
                     cg.coingecko_url,
                     cg.icon_url,
@@ -179,39 +172,43 @@ class PostgreSQLManager:
                         ELSE 999
                     END as days_since_last_attempt,
                     
-                    -- Determinar categoría de prioridad
+                    -- Determinar categoría de prioridad (COHERENTE: hacia atrás en el tiempo)
                     CASE 
-                        WHEN cg.scraping_status = 'pending' THEN 'URGENT'
+                        WHEN cg.scraping_status = 'pending' OR cg.oldest_data_fetched IS NULL THEN 'URGENT'
                         WHEN cg.scraping_status = 'error' AND cg.fetch_error_count < 3 THEN 'RETRY'
                         WHEN cg.scraping_status = 'in_progress' AND 
                              cg.last_fetch_attempt < NOW() - INTERVAL '1 hour' THEN 'STUCK'
+                        -- Para datos históricos: prioridad a cryptos con datos recientes (necesitan más historia)
                         WHEN cg.scraping_status = 'completed' AND 
-                             (cg.last_values_update IS NULL OR 
-                              cg.last_values_update < CURRENT_DATE - INTERVAL '7 days') THEN 'UPDATE'
-                        WHEN cg.scraping_status = 'completed' THEN 'CURRENT'
+                             (cg.oldest_data_fetched IS NULL OR 
+                              cg.oldest_data_fetched > '2020-01-01') THEN 'UPDATE'
+                        -- Cryptos con datos históricos antiguos (antes de 2020) están completas
+                        WHEN cg.scraping_status = 'completed' AND 
+                             cg.oldest_data_fetched <= '2020-01-01' THEN 'CURRENT'
                         ELSE 'UNKNOWN'
                     END as priority_category
                     
                 FROM cryptos c
                 INNER JOIN coingecko_cryptos cg ON c.id = cg.crypto_id
                 WHERE c.is_active = true 
-                AND c.slug IS NOT NULL 
-                AND c.slug != ''
+                AND cg.coin_url IS NOT NULL 
+                AND cg.coin_url != ''
                 ORDER BY 
-                    -- Prioridad por categoría
+                    -- Prioridad por categoría (COHERENTE: para datos históricos hacia atrás)
                     CASE 
-                        WHEN cg.scraping_status = 'pending' THEN 1
+                        WHEN cg.scraping_status = 'pending' OR cg.oldest_data_fetched IS NULL THEN 1
                         WHEN cg.scraping_status = 'in_progress' AND 
                              cg.last_fetch_attempt < NOW() - INTERVAL '1 hour' THEN 2
                         WHEN cg.scraping_status = 'error' AND cg.fetch_error_count < 3 THEN 3
+                        -- Prioridad ALTA para cryptos con datos históricos recientes (necesitan más historia)
                         WHEN cg.scraping_status = 'completed' AND 
-                             (cg.last_values_update IS NULL OR 
-                              cg.last_values_update < CURRENT_DATE - INTERVAL '7 days') THEN 4
-                        WHEN cg.scraping_status = 'completed' THEN 5
+                             (cg.oldest_data_fetched IS NULL OR cg.oldest_data_fetched > '2020-01-01') THEN 4
+                        -- Prioridad BAJA para cryptos con datos históricos completos (antes de 2020)
+                        WHEN cg.scraping_status = 'completed' AND cg.oldest_data_fetched <= '2020-01-01' THEN 8
                         ELSE 6
                     END,
-                    -- Prioridad secundaria por sistema calculado
-                    cg.next_fetch_priority ASC,
+                    -- Prioridad secundaria: más reciente = mayor prioridad (necesita más historia)
+                    cg.oldest_data_fetched DESC NULLS FIRST,
                     -- Prioridad terciaria por ranking
                     cg.coingecko_rank ASC NULLS LAST,
                     -- Última prioridad alfabética
@@ -224,21 +221,25 @@ class PostgreSQLManager:
                 cursor.execute(sql)
                 rows = cursor.fetchall()
                 
-                # Convertir a formato compatible y calcular estadísticas
+                # Convertir a formato compatible
                 cryptocurrencies = []
                 priority_stats = {'URGENT': 0, 'STUCK': 0, 'RETRY': 0, 'UPDATE': 0, 'CURRENT': 0, 'UNKNOWN': 0}
                 
                 for row in rows:
+                    # Construir URL del coin si no existe
+                    coin_url = row['coin_url']
+                    if not coin_url and row['slug']:
+                        coin_url = f"https://www.coingecko.com/es/monedas/{row['slug']}"
+                    
                     crypto = {
                         'crypto_id': row['crypto_id'],
-                        'coingecko_id': row['coingecko_id'],
                         'nombre': row['name'],
                         'simbolo': row['symbol'],
-                        'enlace': row['coin_url'] or f"https://www.coingecko.com/es/monedas/{row['slug']}",
+                        'enlace': coin_url,
                         'slug': row['slug'],
                         'coingecko_rank': row['coingecko_rank'],
-                        'tags': row['tags'] or [],
-                        'badges': row['badges'] or [],
+                        'tags': json.loads(row['tags']) if row['tags'] else [],
+                        'badges': json.loads(row['badges']) if row['badges'] else [],
                         'last_values_update': row['last_values_update'],
                         'oldest_data_fetched': row['oldest_data_fetched'],
                         'scraping_status': row['scraping_status'],
@@ -255,77 +256,21 @@ class PostgreSQLManager:
                     if category in priority_stats:
                         priority_stats[category] += 1
                 
-                logger.info(f"✅ Obtenidas {len(cryptocurrencies)} criptomonedas CoinGecko desde PostgreSQL")
-                logger.info(f"📊 Distribución por prioridad: {priority_stats}")
+                logger.info(f"✅ Obtenidas {len(cryptocurrencies)} criptomonedas CoinGecko para rangos (esquema normalizado)")
+                logger.info(f"📊 Distribución por prioridad (datos históricos hacia atrás): {priority_stats}")
+                logger.info(f"🔍 URGENT: Sin datos históricos | UPDATE: Datos desde 2020+ | CURRENT: Datos desde <2020")
                 
                 return cryptocurrencies
                 
         except Exception as e:
-            logger.error(f"❌ Error obteniendo criptomonedas CoinGecko desde PostgreSQL: {e}")
+            logger.error(f"❌ Error obteniendo criptomonedas CoinGecko para rangos: {e}")
             return []
-    
-    def create_or_update_coingecko_crypto(self, crypto_data: Dict) -> Tuple[int, int]:
-        """Crea o actualiza crypto en esquema normalizado y retorna (crypto_id, coingecko_id)"""
-        if not self.connection:
-            return None, None
-        
-        try:
-            with self.connection.cursor() as cursor:
-                # Usar función auxiliar para obtener o crear crypto principal
-                cursor.execute(
-                    "SELECT get_or_create_crypto(%s, %s, %s)",
-                    (crypto_data['nombre'], crypto_data['simbolo'], crypto_data['slug'])
-                )
-                crypto_id = cursor.fetchone()[0]
-                
-                # Insertar o actualizar datos específicos de CoinGecko
-                cursor.execute("""
-                    INSERT INTO coingecko_cryptos (
-                        crypto_id, coingecko_rank, coingecko_url, icon_url, coin_url,
-                        tags, badges, scraping_status, scraping_notes
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (crypto_id) DO UPDATE SET
-                        coingecko_rank = EXCLUDED.coingecko_rank,
-                        coingecko_url = EXCLUDED.coingecko_url,
-                        icon_url = EXCLUDED.icon_url,
-                        coin_url = EXCLUDED.coin_url,
-                        tags = EXCLUDED.tags,
-                        badges = EXCLUDED.badges,
-                        updated_at = CURRENT_TIMESTAMP
-                    RETURNING id
-                """, (
-                    crypto_id,
-                    crypto_data.get('coingecko_rank'),
-                    crypto_data.get('coingecko_url'),
-                    crypto_data.get('icon_url'),
-                    crypto_data.get('enlace'),
-                    crypto_data.get('tags', []),
-                    crypto_data.get('badges', []),
-                    'pending',
-                    'Crypto añadida desde scraper histórico'
-                ))
-                
-                coingecko_id = cursor.fetchone()[0]
-                self.connection.commit()
-                
-                logger.debug(f"✅ Crypto creada/actualizada: {crypto_data['simbolo']} (crypto_id: {crypto_id}, coingecko_id: {coingecko_id})")
-                return crypto_id, coingecko_id
-                
-        except Exception as e:
-            logger.error(f"❌ Error creando/actualizando crypto {crypto_data.get('simbolo', 'UNKNOWN')}: {e}")
-            if self.connection:
-                self.connection.rollback()
-            return None, None
     
     def update_coingecko_scraping_progress(self, crypto_id: int = None, symbol: str = None, name: str = None, 
                                          status: str = 'in_progress', total_points: int = 0, 
                                          oldest_date: str = None, latest_date: str = None, 
                                          notes: str = None):
-        """
-        Actualiza el progreso de scraping en tabla coingecko_cryptos
-        
-        ARREGLADO: Usa crypto_id directamente cuando está disponible para evitar duplicados por símbolo
-        """
+        """Actualiza el progreso de scraping usando crypto_id (COHERENTE con SeleniumCryptoDataScraper)"""
         if not self.connection:
             return
         
@@ -360,24 +305,19 @@ class PostgreSQLManager:
                 elif status == 'error':
                     update_fields.append("fetch_error_count = fetch_error_count + 1")
                 
-                elif status == 'in_progress':
-                    # No incrementar error count para in_progress
-                    pass
-                
                 # Notas descriptivas
                 if notes:
                     update_fields.append("scraping_notes = %s")
                     params.append(notes)
                 
-                # SOLUCIÓN AL ERROR: Usar crypto_id directamente cuando esté disponible
+                # Usar crypto_id directamente (método preferido)
                 if crypto_id:
-                    # Usar crypto_id directamente (método preferido)
                     params.append(crypto_id)
                     where_clause = "WHERE crypto_id = %s"
                     identifier = f"crypto_id={crypto_id}"
                     
                 elif symbol and name:
-                    # Usar combinación de symbol y name para identificar únicamente
+                    # Fallback: usar combinación de symbol y name
                     params.extend([symbol, name])
                     where_clause = """
                         WHERE crypto_id = (
@@ -388,22 +328,8 @@ class PostgreSQLManager:
                     """
                     identifier = f"{symbol} ({name})"
                     
-                elif symbol:
-                    # Fallback: usar solo symbol pero con LIMIT 1 para evitar error
-                    params.append(symbol)
-                    where_clause = """
-                        WHERE crypto_id = (
-                            SELECT id FROM cryptos 
-                            WHERE symbol = %s 
-                            ORDER BY id 
-                            LIMIT 1
-                        )
-                    """
-                    identifier = f"{symbol} (por symbol - primer match)"
-                    logger.warning(f"⚠️ Usando solo symbol para {symbol}, puede no ser único")
-                    
                 else:
-                    logger.error("❌ No se proporcionó crypto_id, symbol o name para identificar la crypto")
+                    logger.error("❌ No se proporcionó crypto_id válido para identificar la crypto")
                     return
                 
                 sql = f"""
@@ -426,16 +352,13 @@ class PostgreSQLManager:
             if self.connection:
                 self.connection.rollback()
     
-    
-    
     def get_coingecko_scraping_stats(self) -> Dict:
-        """Obtiene estadísticas de scraping de CoinGecko usando consultas directas"""
+        """Obtiene estadísticas de scraping de CoinGecko"""
         if not self.connection:
             return {}
         
         try:
             with self.connection.cursor() as cursor:
-                # Consulta directa a las tablas base sin depender de vistas
                 cursor.execute("""
                     SELECT 
                         cg.scraping_status,
@@ -470,7 +393,7 @@ class PostgreSQLManager:
             logger.info("🔐 Conexión PostgreSQL cerrada")
 
 class InfluxDBManager:
-    """Manejador de InfluxDB para datos históricos de CoinGecko"""
+    """Manejador de InfluxDB para datos históricos por rangos (COHERENTE con SeleniumCryptoDataScraper)"""
     
     def __init__(self, config: InfluxDBConfig):
         self.config = config
@@ -478,10 +401,28 @@ class InfluxDBManager:
         self.write_api = None
         
     def connect(self):
-        """Conectar a InfluxDB v2"""
+        """Conectar a InfluxDB (compatible con 1.x y 2.x)"""
         try:
-            url = f"http://{self.config.host}:{self.config.port}"
+            # Para InfluxDB 1.x (sin token)
+            if not self.config.token:
+                # InfluxDB 1.x
+                from influxdb import InfluxDBClient
+                self.client = InfluxDBClient(
+                    host=self.config.host,
+                    port=self.config.port,
+                    database=self.config.database
+                )
+                # Verificar conexión
+                try:
+                    self.client.ping()
+                    logger.info(f"✅ Conectado a InfluxDB 1.x: {self.config.host}:{self.config.port}")
+                    return True
+                except Exception as e:
+                    logger.error(f"❌ Error conectando a InfluxDB 1.x: {e}")
+                    return False
             
+            # InfluxDB 2.x (con token)
+            url = f"http://{self.config.host}:{self.config.port}"
             logger.info(f"🔄 Conectando a InfluxDB v2: {url}")
             
             self.client = influxdb_client.InfluxDBClient(
@@ -507,212 +448,259 @@ class InfluxDBManager:
             logger.error(f"❌ Error conectando a InfluxDB: {e}")
             return False
     
-    def save_coingecko_historical_data(self, crypto_data: Dict, combined_data: List[Dict]) -> Dict:
-        """Guarda datos históricos de CoinGecko en InfluxDB con metadatos específicos"""
-        if not combined_data or not self.write_api:
-            logger.warning("⚠️ No hay datos o write_api no disponible")
+    def save_coingecko_range_data(self, crypto_data: Dict, start_date: str, end_date: str, 
+                                 combined_data: List[Dict]) -> Dict:
+        """Guarda datos de rango CoinGecko en InfluxDB (COHERENTE con SeleniumCryptoDataScraper)"""
+        if not combined_data:
+            logger.warning("⚠️ No hay datos para guardar")
             return {'success': False, 'points_saved': 0}
         
         try:
-            points = []
-            timestamps = []
+            # Para InfluxDB 1.x
+            if not self.config.token and hasattr(self.client, 'write_points'):
+                return self._save_to_influxdb_1x(crypto_data, start_date, end_date, combined_data)
             
-            symbol = crypto_data.get('simbolo', 'UNKNOWN')
-            name = crypto_data.get('nombre', 'Unknown')
-            slug = crypto_data.get('slug', '')
-            coingecko_rank = crypto_data.get('coingecko_rank')
+            # Para InfluxDB 2.x
+            elif self.write_api:
+                return self._save_to_influxdb_2x(crypto_data, start_date, end_date, combined_data)
             
-            logger.info(f"🔄 Preparando {len(combined_data)} puntos históricos CoinGecko para {symbol}...")
-            
-            for data_point in combined_data:
-                try:
-                    # ARREGLADO: Validar timestamp antes de conversión
-                    timestamp_ms = data_point.get('timestamp')
-                    if timestamp_ms is None or timestamp_ms == 0:
-                        logger.debug(f"⚠️ Timestamp inválido para {symbol}: {timestamp_ms}")
-                        continue
-                    
-                    # Asegurar que timestamp_ms es numérico
-                    try:
-                        timestamp_ms = float(timestamp_ms)
-                        if timestamp_ms <= 0:
-                            continue
-                    except (ValueError, TypeError):
-                        logger.debug(f"⚠️ Timestamp no numérico para {symbol}: {timestamp_ms}")
-                        continue
-                    
-                    # CoinGecko timestamps están en milisegundos
-                    timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
-                    timestamps.append(timestamp_dt)
-                    
-                    price = data_point.get('price')
-                    market_cap = data_point.get('market_cap')
-                    
-                    # Validar que tenemos al menos un dato válido
-                    if price is None and market_cap is None:
-                        continue
-                    
-                    # Crear punto para InfluxDB con tags específicos de CoinGecko
-                    point = Point("coingecko_historical")
-                    point.tag("symbol", symbol)
-                    point.tag("name", name)
-                    point.tag("slug", slug)
-                    point.tag("source", "coingecko_full_historical")
-                    
-                    # ARREGLADO: Tags adicionales específicos de CoinGecko con validación
-                    if coingecko_rank is not None:
-                        try:
-                            rank_int = int(float(coingecko_rank))  # Convertir vía float para manejar strings
-                            point.tag("rank_category", self._get_rank_category(rank_int))
-                            point.field("coingecko_rank", rank_int)
-                        except (ValueError, TypeError):
-                            logger.debug(f"⚠️ Ranking inválido para {symbol}: {coingecko_rank}")
-                    
-                    # ARREGLADO: Campos de datos con validación mejorada
-                    if price is not None:
-                        try:
-                            price_float = float(price)
-                            if price_float >= 0:  # Permitir precio 0
-                                point.field("price", price_float)
-                        except (ValueError, TypeError):
-                            logger.debug(f"⚠️ Precio inválido para {symbol}: {price}")
-                    
-                    if market_cap is not None:
-                        try:
-                            market_cap_float = float(market_cap)
-                            if market_cap_float >= 0:  # Permitir market cap 0
-                                point.field("market_cap", market_cap_float)
-                        except (ValueError, TypeError):
-                            logger.debug(f"⚠️ Market cap inválido para {symbol}: {market_cap}")
-                    
-                    # Campos calculados
-                    point.field("data_quality_score", self._calculate_data_quality(price, market_cap))
-                    
-                    point.time(timestamp_dt)
-                    points.append(point)
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️ Error procesando punto de datos para {symbol}: {e}")
-                    continue
-            
-            if points:
-                logger.info(f"🔄 Escribiendo {len(points)} puntos históricos CoinGecko a InfluxDB...")
-                
-                # Escribir en lotes para mejor rendimiento
-                batch_size = 1000
-                points_written = 0
-                
-                for i in range(0, len(points), batch_size):
-                    batch = points[i:i + batch_size]
-                    
-                    self.write_api.write(
-                        bucket=self.config.database,
-                        org=self.config.org,
-                        record=batch
-                    )
-                    
-                    points_written += len(batch)
-                    logger.debug(f"✅ Lote {i//batch_size + 1} escrito ({len(batch)} puntos)")
-                
-                # Calcular estadísticas de fechas
-                oldest_date = min(timestamps).strftime('%Y-%m-%d') if timestamps else None
-                latest_date = max(timestamps).strftime('%Y-%m-%d') if timestamps else None
-                
-                logger.info(f"✅ Guardados {points_written} puntos históricos CoinGecko para {symbol}")
-                logger.info(f"📅 Rango temporal: {oldest_date} → {latest_date}")
-                
-                return {
-                    'success': True,
-                    'points_saved': points_written,
-                    'oldest_date': oldest_date,
-                    'latest_date': latest_date,
-                    'date_range_days': (max(timestamps) - min(timestamps)).days if len(timestamps) > 1 else 0
-                }
             else:
-                logger.warning(f"⚠️ No hay puntos válidos para insertar para {symbol}")
+                logger.error("❌ Cliente InfluxDB no configurado correctamente")
                 return {'success': False, 'points_saved': 0}
                 
         except Exception as e:
-            logger.error(f"❌ Error guardando datos históricos CoinGecko para {symbol}: {e}")
+            logger.error(f"❌ Error guardando datos de rango: {e}")
             return {'success': False, 'points_saved': 0, 'error': str(e)}
     
-    def _get_rank_category(self, rank) -> str:
-        """Categoriza el ranking de CoinGecko"""
-        try:
-            # ARREGLADO: Validar y convertir rank antes de usar
-            if rank is None:
-                return "unranked"
+    def _save_to_influxdb_1x(self, crypto_data: Dict, start_date: str, end_date: str, combined_data: List[Dict]) -> Dict:
+        """Guardar en InfluxDB 1.x"""
+        symbol = crypto_data.get('simbolo', 'UNKNOWN')
+        name = crypto_data.get('nombre', 'Unknown')
+        slug = crypto_data.get('slug', '')
+        
+        points = []
+        timestamps = []
+        
+        for data_point in combined_data:
+            try:
+                timestamp_ms = data_point.get('timestamp')
+                if timestamp_ms is None or timestamp_ms <= 0:
+                    continue
+                
+                # CoinGecko timestamps están en milisegundos
+                timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+                timestamps.append(timestamp_dt)
+                
+                price = data_point.get('price')
+                market_cap = data_point.get('market_cap')
+                
+                # Validar que tenemos al menos un dato válido
+                if price is None and market_cap is None:
+                    continue
+                
+                # Punto para InfluxDB 1.x
+                point = {
+                    "measurement": "coingecko_historical_ranges",
+                    "tags": {
+                        "symbol": symbol,
+                        "name": name,
+                        "slug": slug,
+                        "source": "coingecko_ranges_normalized",
+                        "range_start": start_date,
+                        "range_end": end_date
+                    },
+                    "time": timestamp_dt.isoformat(),
+                    "fields": {}
+                }
+                
+                # Agregar campos válidos
+                if price is not None:
+                    try:
+                        price_float = float(price)
+                        if price_float >= 0:
+                            point["fields"]["price"] = price_float
+                    except (ValueError, TypeError):
+                        pass
+                
+                if market_cap is not None:
+                    try:
+                        market_cap_float = float(market_cap)
+                        if market_cap_float >= 0:
+                            point["fields"]["market_cap"] = market_cap_float
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Solo agregar si tiene campos válidos
+                if point["fields"]:
+                    points.append(point)
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Error procesando punto de datos para {symbol}: {e}")
+                continue
+        
+        if points:
+            # Escribir en lotes
+            batch_size = 1000
+            points_written = 0
             
-            rank_int = int(float(rank))
+            for i in range(0, len(points), batch_size):
+                batch = points[i:i + batch_size]
+                
+                success = self.client.write_points(batch)
+                if success:
+                    points_written += len(batch)
+                    logger.debug(f"✅ Lote escrito ({len(batch)} puntos)")
+                else:
+                    logger.error(f"❌ Error escribiendo lote {i//batch_size + 1}")
             
-            if rank_int <= 10:
-                return "top_10"
-            elif rank_int <= 50:
-                return "top_50"
-            elif rank_int <= 100:
-                return "top_100"
-            elif rank_int <= 500:
-                return "top_500"
-            else:
-                return "others"
-        except (ValueError, TypeError):
-            return "unranked"
+            # Calcular estadísticas
+            oldest_date = min(timestamps).strftime('%Y-%m-%d') if timestamps else None
+            latest_date = max(timestamps).strftime('%Y-%m-%d') if timestamps else None
+            
+            logger.info(f"✅ Guardados {points_written} puntos de rango para {symbol}")
+            logger.info(f"📅 Rango temporal: {oldest_date} → {latest_date}")
+            
+            return {
+                'success': True,
+                'points_saved': points_written,
+                'oldest_date': oldest_date,
+                'latest_date': latest_date,
+                'date_range_days': (max(timestamps) - min(timestamps)).days if len(timestamps) > 1 else 0
+            }
+        else:
+            logger.warning(f"⚠️ No hay puntos válidos para insertar para {symbol}")
+            return {'success': False, 'points_saved': 0}
     
-    def _calculate_data_quality(self, price, market_cap) -> float:
-        """Calcula un score de calidad de datos"""
-        score = 0.0
+    def _save_to_influxdb_2x(self, crypto_data: Dict, start_date: str, end_date: str, combined_data: List[Dict]) -> Dict:
+        """Guardar en InfluxDB 2.x"""
+        symbol = crypto_data.get('simbolo', 'UNKNOWN')
+        name = crypto_data.get('nombre', 'Unknown')
+        slug = crypto_data.get('slug', '')
         
-        # ARREGLADO: Validar valores antes de usar
-        try:
-            if price is not None and float(price) > 0:
-                score += 0.5
-        except (ValueError, TypeError):
-            pass
+        points = []
+        timestamps = []
         
-        try:
-            if market_cap is not None and float(market_cap) > 0:
-                score += 0.5
-        except (ValueError, TypeError):
-            pass
+        for data_point in combined_data:
+            try:
+                timestamp_ms = data_point.get('timestamp')
+                if timestamp_ms is None or timestamp_ms <= 0:
+                    continue
+                
+                # CoinGecko timestamps están en milisegundos
+                timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+                timestamps.append(timestamp_dt)
+                
+                price = data_point.get('price')
+                market_cap = data_point.get('market_cap')
+                
+                # Validar que tenemos al menos un dato válido
+                if price is None and market_cap is None:
+                    continue
+                
+                # Crear punto para InfluxDB 2.x
+                point = Point("coingecko_historical_ranges")
+                point.tag("symbol", symbol)
+                point.tag("name", name)
+                point.tag("slug", slug)
+                point.tag("source", "coingecko_ranges_normalized")
+                point.tag("range_start", start_date)
+                point.tag("range_end", end_date)
+                
+                # Agregar campos válidos
+                if price is not None:
+                    try:
+                        price_float = float(price)
+                        if price_float >= 0:
+                            point.field("price", price_float)
+                    except (ValueError, TypeError):
+                        pass
+                
+                if market_cap is not None:
+                    try:
+                        market_cap_float = float(market_cap)
+                        if market_cap_float >= 0:
+                            point.field("market_cap", market_cap_float)
+                    except (ValueError, TypeError):
+                        pass
+                
+                point.time(timestamp_dt)
+                points.append(point)
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Error procesando punto de datos para {symbol}: {e}")
+                continue
         
-        return score
+        if points:
+            # Escribir en lotes
+            batch_size = 1000
+            points_written = 0
+            
+            for i in range(0, len(points), batch_size):
+                batch = points[i:i + batch_size]
+                
+                self.write_api.write(
+                    bucket=self.config.database,
+                    org=self.config.org,
+                    record=batch
+                )
+                
+                points_written += len(batch)
+                logger.debug(f"✅ Lote escrito ({len(batch)} puntos)")
+            
+            # Calcular estadísticas
+            oldest_date = min(timestamps).strftime('%Y-%m-%d') if timestamps else None
+            latest_date = max(timestamps).strftime('%Y-%m-%d') if timestamps else None
+            
+            logger.info(f"✅ Guardados {points_written} puntos de rango para {symbol}")
+            logger.info(f"📅 Rango temporal: {oldest_date} → {latest_date}")
+            
+            return {
+                'success': True,
+                'points_saved': points_written,
+                'oldest_date': oldest_date,
+                'latest_date': latest_date,
+                'date_range_days': (max(timestamps) - min(timestamps)).days if len(timestamps) > 1 else 0
+            }
+        else:
+            logger.warning(f"⚠️ No hay puntos válidos para insertar para {symbol}")
+            return {'success': False, 'points_saved': 0}
     
     def close(self):
         """Cerrar conexión a InfluxDB"""
         if self.client:
-            self.client.close()
+            if hasattr(self.client, 'close'):
+                self.client.close()
             logger.info("🔐 Conexión InfluxDB cerrada")
 
-class SeleniumCryptoDataScraper:
-    def __init__(self, output_dir: str = "values", headless: bool = True, delay: float = 2.0, 
-                 influxdb_config: InfluxDBConfig = None, postgres_config: PostgreSQLConfig = None,
-                 crypto_limit: Optional[int] = None):
-        self.output_dir = output_dir
+class SeleniumRangeCryptoDataScraper:
+    def __init__(self, 
+                 delay: float = 2.0,
+                 headless: bool = True,
+                 range_days: int = 30,
+                 crypto_limit: Optional[int] = None,
+                 influxdb_config: InfluxDBConfig = None,
+                 postgres_config: PostgreSQLConfig = None):
         self.delay = delay
-        self.driver = None
+        self.range_days = range_days
         self.crypto_limit = crypto_limit
+        self.driver = None
         
-        # Manejadores de base de datos
+        # Manejadores de base de datos (COHERENTE con SeleniumCryptoDataScraper)
         self.influxdb_config = influxdb_config or InfluxDBConfig()
         self.postgres_config = postgres_config or PostgreSQLConfig()
         self.influx_manager = InfluxDBManager(self.influxdb_config)
         self.postgres_manager = PostgreSQLManager(self.postgres_config)
         
         self.setup_driver(headless)
-        
-        # Crear directorio de salida si no existe (para respaldos JSON)
-        os.makedirs(self.output_dir, exist_ok=True)
     
     def setup_driver(self, headless: bool = True):
-        """
-        Configura el driver de Chrome con opciones anti-detección
-        """
+        """Configura el driver de Chrome con opciones anti-detección"""
         chrome_options = Options()
         
         if headless:
             chrome_options.add_argument("--headless")
         
-        # Opciones anti-detección
+        # Opciones anti-detección optimizadas
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
@@ -733,7 +721,6 @@ class SeleniumCryptoDataScraper:
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         
         try:
-            # Usar webdriver-manager para automáticamente descargar ChromeDriver
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
             
@@ -745,18 +732,16 @@ class SeleniumCryptoDataScraper:
             logger.info("✅ Driver de Chrome configurado correctamente")
         except Exception as e:
             logger.error(f"❌ Error al configurar Chrome driver: {e}")
-            logger.error("Intenta instalar/actualizar: pip install webdriver-manager")
             raise
     
     def connect_databases(self):
-        """Conectar a PostgreSQL e InfluxDB con verificación de esquema normalizado"""
+        """Conectar a PostgreSQL e InfluxDB"""
         postgres_connected = False
         influx_connected = False
         
         try:
             postgres_connected = self.postgres_manager.connect()
             if postgres_connected:
-                # Mostrar estadísticas iniciales usando vistas del esquema normalizado
                 stats = self.postgres_manager.get_coingecko_scraping_stats()
                 if stats:
                     logger.info("📊 Estado actual scraping CoinGecko:")
@@ -772,46 +757,14 @@ class SeleniumCryptoDataScraper:
         
         return postgres_connected, influx_connected
     
-    def random_delay(self, min_delay: float = 1.0, max_delay: float = 3.0):
-        """
-        Implementa un delay aleatorio entre requests
-        """
-        delay = random.uniform(min_delay, max_delay)
-        time.sleep(delay)
-    
     def load_cryptocurrencies(self) -> List[Dict]:
         """Carga lista de criptomonedas CoinGecko desde esquema normalizado"""
         try:
-            cryptocurrencies = self.postgres_manager.get_coingecko_cryptocurrencies_with_priority(limit=self.crypto_limit)
+            cryptocurrencies = self.postgres_manager.get_coingecko_cryptocurrencies_for_ranges(limit=self.crypto_limit)
             
             if not cryptocurrencies:
                 logger.warning("⚠️ No se encontraron criptomonedas CoinGecko en PostgreSQL")
-                logger.info("💡 Intentando cargar desde archivo JSON como respaldo...")
-                
-                # Fallback al archivo JSON si existe
-                try:
-                    with open("criptomonedas.json", 'r', encoding='utf-8') as f:
-                        json_cryptos = json.load(f)
-                        # Adaptar formato para esquema normalizado
-                        cryptocurrencies = []
-                        for crypto in json_cryptos[:self.crypto_limit] if self.crypto_limit else json_cryptos:
-                            adapted = {
-                                'nombre': crypto.get('nombre', ''),
-                                'simbolo': crypto.get('simbolo', ''),
-                                'enlace': crypto.get('enlace', ''),
-                                'slug': crypto.get('enlace', '').split('/')[-1] if crypto.get('enlace') else '',
-                                'scraping_status': 'pending',
-                                'priority_category': 'URGENT'
-                            }
-                            cryptocurrencies.append(adapted)
-                        
-                        logger.info(f"✅ Cargadas {len(cryptocurrencies)} criptomonedas desde archivo JSON de respaldo")
-                except FileNotFoundError:
-                    logger.error("❌ No se encontró archivo JSON de respaldo")
-                    return []
-                except json.JSONDecodeError:
-                    logger.error("❌ El archivo JSON de respaldo no tiene un formato válido")
-                    return []
+                return []
             
             return cryptocurrencies
             
@@ -820,16 +773,36 @@ class SeleniumCryptoDataScraper:
             return []
     
     def extract_url_name(self, enlace: str) -> str:
-        """Extrae el nombre de la URL del enlace (último segmento después del último '/')"""
+        """Extrae el nombre de la URL del enlace"""
         return enlace.rstrip('/').split('/')[-1]
     
-    def get_json_data(self, url: str, data_type: str, crypto_name: str) -> Optional[List]:
-        """
-        Obtiene datos JSON usando Selenium
-        data_type: 'price_charts' o 'market_cap'
-        """
+    def timestamp_for_date(self, date_str: str, is_end: bool = False) -> int:
+        """Convierte fecha string a timestamp Unix"""
         try:
-            logger.info(f"🔄 Obteniendo {data_type} para {crypto_name} desde: {url}")
+            dt = datetime.strptime(date_str, '%Y-%m-%d')
+            if is_end:
+                dt = dt.replace(hour=23, minute=59, second=59)
+            else:
+                dt = dt.replace(hour=0, minute=0, second=0)
+            
+            return int(dt.timestamp())
+        except Exception as e:
+            logger.error(f"❌ Error convirtiendo fecha {date_str}: {e}")
+            return 0
+    
+    def download_range_data_selenium(self, url_name: str, start_date: str, end_date: str, data_type: str) -> Optional[List]:
+        """Descarga datos para un rango de fechas usando Selenium"""
+        timestamp_from = self.timestamp_for_date(start_date)
+        timestamp_to = self.timestamp_for_date(end_date, True)
+        
+        if timestamp_from == 0 or timestamp_to == 0:
+            logger.error(f"❌ Timestamps inválidos para {url_name} - {start_date} a {end_date}")
+            return None
+        
+        url = f"https://www.coingecko.com/{data_type}/{url_name}/usd/custom.json?from={timestamp_from}&to={timestamp_to}"
+        
+        try:
+            logger.info(f"🔄 Descargando {data_type} para {url_name} - {start_date} a {end_date}")
             
             # Navegar a la URL
             self.driver.get(url)
@@ -837,7 +810,7 @@ class SeleniumCryptoDataScraper:
             # Esperar a que se cargue el contenido JSON
             wait = WebDriverWait(self.driver, 15)
             
-            # Buscar el elemento <pre> que contiene el JSON (típico en respuestas JSON del navegador)
+            # Buscar el elemento <pre> que contiene el JSON
             try:
                 json_element = wait.until(
                     EC.presence_of_element_located((By.TAG_NAME, "pre"))
@@ -845,42 +818,36 @@ class SeleniumCryptoDataScraper:
                 json_text = json_element.text
             except TimeoutException:
                 # Si no hay elemento <pre>, intentar obtener el texto completo de la página
-                json_text = self.driver.find_element(By.TAG_NAME, "body").text
+                try:
+                    body_element = self.driver.find_element(By.TAG_NAME, "body")
+                    json_text = body_element.text
+                except Exception:
+                    logger.error(f"❌ No se pudo encontrar contenido JSON para {url_name} - {start_date} a {end_date}")
+                    return None
+            
+            # Verificar si hay contenido
+            if not json_text.strip():
+                logger.warning(f"⚠️ Respuesta vacía para {url_name} - {start_date} a {end_date} ({data_type})")
+                return None
             
             # Parsear el JSON
-            if json_text.strip():
-                try:
-                    data = json.loads(json_text)
-                    stats = data.get('stats', [])
-                    logger.info(f"✅ Obtenidos {len(stats)} puntos de datos para {crypto_name} ({data_type})")
-                    return stats
-                except json.JSONDecodeError as e:
-                    logger.error(f"❌ Error al parsear JSON para {crypto_name} ({data_type}): {e}")
-                    return None
-            else:
-                logger.warning(f"⚠️ Respuesta vacía para {crypto_name} ({data_type})")
+            try:
+                data = json.loads(json_text)
+                stats = data.get('stats', [])
+                
+                logger.info(f"✅ {len(stats)} registros para {url_name} - {start_date} a {end_date} ({data_type})")
+                return stats
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Error al parsear JSON para {url_name} - {start_date} a {end_date} ({data_type}): {e}")
                 return None
                 
-        except TimeoutException:
-            logger.error(f"❌ Timeout al cargar datos para {crypto_name} ({data_type})")
-            return None
-        except WebDriverException as e:
-            logger.error(f"❌ Error de WebDriver para {crypto_name} ({data_type}): {e}")
-            return None
         except Exception as e:
-            logger.error(f"❌ Error inesperado para {crypto_name} ({data_type}): {e}")
+            logger.error(f"❌ Error descargando datos para {url_name} - {start_date} a {end_date} ({data_type}): {e}")
             return None
     
-    def get_crypto_data(self, url_name: str, data_type: str) -> Optional[List]:
-        """
-        Obtiene datos de precios o capitalización de mercado
-        data_type: 'price_charts' o 'market_cap'
-        """
-        url = f"https://www.coingecko.com/{data_type}/{url_name}/usd/max.json"
-        return self.get_json_data(url, data_type, url_name)
-    
-    def combine_data(self, price_data: List, market_cap_data: List) -> List[Dict]:
-        """Combina datos de precios y capitalización de mercado según timestamp"""
+    def combine_range_data(self, price_data: List, market_cap_data: List) -> List[Dict]:
+        """Combina datos de precios y capitalización por timestamp para un rango"""
         combined_data = []
         
         # Convertir market_cap_data a diccionario para búsqueda rápida
@@ -889,20 +856,19 @@ class SeleniumCryptoDataScraper:
             for item in market_cap_data:
                 try:
                     if len(item) >= 2 and item[0] is not None:
-                        timestamp = int(float(item[0]))  # ARREGLADO: Validar antes de convertir
+                        timestamp = int(float(item[0]))
                         market_cap_dict[timestamp] = item[1]
                 except (ValueError, TypeError, IndexError):
-                    continue  # Saltar items inválidos
+                    continue
         
         # Procesar datos de precios
         if price_data:
             for price_item in price_data:
                 try:
                     if len(price_item) >= 2 and price_item[0] is not None:
-                        # ARREGLADO: Validar timestamp antes de convertir
                         timestamp = int(float(price_item[0]))
                         price = price_item[1]
-                        market_cap = market_cap_dict.get(timestamp)
+                        market_cap = market_cap_dict.get(timestamp, None)
                         
                         # Solo añadir si tenemos datos válidos
                         if price is not None or market_cap is not None:
@@ -912,121 +878,163 @@ class SeleniumCryptoDataScraper:
                                 'market_cap': market_cap
                             })
                 except (ValueError, TypeError, IndexError):
-                    continue  # Saltar items inválidos
+                    continue
         
-        logger.info(f"✅ Combinados {len(combined_data)} puntos de datos válidos")
+        logger.info(f"✅ Combinados {len(combined_data)} puntos de datos válidos para rango")
         return combined_data
     
-    def save_crypto_data_backup(self, symbol: str, combined_data: List[Dict]) -> bool:
-        """Guarda los datos combinados en un archivo JSON como respaldo"""
-        filename = f"{symbol}.json"
-        filepath = os.path.join(self.output_dir, filename)
+    def random_delay(self, min_delay: float = None, max_delay: float = None):
+        """Delay aleatorio entre peticiones"""
+        if min_delay is None:
+            min_delay = self.delay
+        if max_delay is None:
+            max_delay = self.delay * 1.5
         
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'symbol': symbol,
-                    'data': combined_data,
-                    'total_records': len(combined_data),
-                    'scraped_at': datetime.now().isoformat(),
-                    'source': 'coingecko_normalized_schema'
-                }, f, indent=2, ensure_ascii=False)
-            
-            logger.debug(f"📁 Respaldo JSON guardado para {symbol} ({len(combined_data)} registros)")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Error al guardar respaldo JSON para {symbol}: {e}")
-            return False
+        delay = random.uniform(min_delay, max_delay)
+        time.sleep(delay)
     
-    def process_cryptocurrency_normalized(self, crypto: Dict) -> bool:
-        """Procesa criptomoneda usando esquema normalizado"""
+    def process_cryptocurrency_ranges_normalized(self, crypto: Dict) -> bool:
+        """Procesa una criptomoneda por rangos hacia atrás desde oldest_data_fetched"""
         symbol = crypto.get('simbolo', '').upper()
         enlace = crypto.get('enlace', '')
         nombre = crypto.get('nombre', '')
         priority_category = crypto.get('priority_category', 'UNKNOWN')
         current_status = crypto.get('scraping_status', 'pending')
-        error_count = crypto.get('fetch_error_count', 0)
-        crypto_id = crypto.get('crypto_id')  # IMPORTANTE: Obtener crypto_id
+        crypto_id = crypto.get('crypto_id')
         
         if not symbol or not enlace:
             logger.warning(f"⚠️ Datos incompletos para {nombre}")
             return False
         
-        logger.info(f"\n📊 Procesando {nombre} ({symbol}) - Prioridad: {priority_category}")
-        logger.info(f"🔄 Estado actual: {current_status} | Errores: {error_count} | ID: {crypto_id}")
+        logger.info(f"\n📊 Procesando rangos {nombre} ({symbol}) - Prioridad: {priority_category}")
+        logger.info(f"🔄 Estado actual: {current_status} | ID: {crypto_id}")
+        
+        # Obtener fecha más antigua actual
+        oldest_date_str = crypto.get('oldest_data_fetched')
+        if oldest_date_str:
+            logger.info(f"📅 Datos históricos actuales desde: {oldest_date_str}")
+            logger.info(f"🔙 Continuando hacia atrás desde {oldest_date_str}")
+            # Convertir a datetime para cálculos
+            try:
+                oldest_date = datetime.strptime(str(oldest_date_str), '%Y-%m-%d')
+            except ValueError:
+                logger.warning(f"⚠️ Fecha inválida en oldest_data_fetched: {oldest_date_str}, usando hoy")
+                oldest_date = datetime.now()
+        else:
+            oldest_date = datetime.now()
+            logger.info(f"📅 Sin datos históricos - empezando desde hoy hacia atrás")
         
         start_time = time.time()
         
-        # ARREGLADO: Marcar como en progreso usando crypto_id cuando esté disponible
+        # Marcar como en progreso
         self.postgres_manager.update_coingecko_scraping_progress(
             crypto_id=crypto_id,
             symbol=symbol,
             name=nombre,
             status='in_progress',
-            notes=f'Iniciando descarga histórica (prioridad: {priority_category})'
+            notes=f'Buscando datos hacia atrás desde {oldest_date.strftime("%Y-%m-%d")} (prioridad: {priority_category})'
         )
         
         # Extraer nombre de URL
         url_name = self.extract_url_name(enlace)
-        logger.info(f"🔍 Nombre URL extraído: {url_name}")
+        logger.info(f"🔍 URL name: {url_name}")
         
         try:
-            # Obtener datos de precios
-            price_data = self.get_crypto_data(url_name, 'price_charts')
-            if not price_data:
-                logger.error(f"❌ No se pudieron obtener datos de precios para {symbol}")
-                duration = int(time.time() - start_time)
+            # Calcular rango hacia atrás desde oldest_data_fetched
+            # End date: fecha más antigua actual (o un día antes si ya tenemos datos)
+            if oldest_date_str:
+                # Si ya tenemos datos, empezar un día antes de la fecha más antigua
+                end_date = (oldest_date - timedelta(days=1)).strftime('%Y-%m-%d')
+            else:
+                # Si no tenemos datos, empezar desde hoy
+                end_date = oldest_date.strftime('%Y-%m-%d')
+            
+            # Start date: ir hacia atrás N días desde end_date
+            start_date_dt = datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=self.range_days - 1)
+            start_date = start_date_dt.strftime('%Y-%m-%d')
+            
+            logger.info(f"📦 Procesando rango histórico {symbol}: {start_date} → {end_date}")
+            logger.info(f"🔙 Buscando {self.range_days} días hacia atrás")
+            
+            # Validar que no vamos demasiado al pasado (límite razonable)
+            min_date = datetime(2009, 1, 1)  # Bitcoin empezó en 2009
+            if start_date_dt < min_date:
+                logger.info(f"📅 Alcanzado límite histórico mínimo (2009-01-01) para {symbol}")
+                # Ajustar start_date al límite mínimo
+                start_date = min_date.strftime('%Y-%m-%d')
                 
-                # ARREGLADO: Usar crypto_id en la actualización
+                # Si el rango resultante es muy pequeño, considerar completo
+                if (datetime.strptime(end_date, '%Y-%m-%d') - min_date).days < 30:
+                    logger.info(f"✅ {symbol} tiene datos históricos completos hasta los orígenes")
+                    self.postgres_manager.update_coingecko_scraping_progress(
+                        crypto_id=crypto_id,
+                        symbol=symbol,
+                        name=nombre,
+                        status='completed',
+                        oldest_date=min_date.strftime('%Y-%m-%d'),
+                        notes='Datos históricos completos hasta el límite mínimo (2009)'
+                    )
+                    return True
+            
+            # Descargar datos de precios para el rango
+            price_data = self.download_range_data_selenium(url_name, start_date, end_date, 'price_charts')
+            if not price_data:
+                logger.error(f"❌ No se pudieron obtener datos de precios para {symbol} ({start_date} → {end_date})")
+                
                 self.postgres_manager.update_coingecko_scraping_progress(
                     crypto_id=crypto_id,
                     symbol=symbol,
                     name=nombre,
                     status='error',
-                    notes='Error obteniendo datos de precios desde CoinGecko'
+                    notes=f'Error obteniendo datos de precios para rango {start_date} → {end_date}'
                 )
                 
                 return False
             
             # Delay entre peticiones
-            self.random_delay(self.delay, self.delay * 1.5)
+            self.random_delay()
             
-            # Obtener datos de capitalización de mercado
-            market_cap_data = self.get_crypto_data(url_name, 'market_cap')
+            # Descargar datos de capitalización de mercado para el rango
+            market_cap_data = self.download_range_data_selenium(url_name, start_date, end_date, 'market_cap')
             if not market_cap_data:
-                logger.warning(f"⚠️ No se pudieron obtener datos de capitalización para {symbol}")
+                logger.warning(f"⚠️ No se pudieron obtener datos de capitalización para {symbol} ({start_date} → {end_date})")
                 market_cap_data = []
             
             # Combinar datos
-            combined_data = self.combine_data(price_data, market_cap_data)
+            combined_data = self.combine_range_data(price_data, market_cap_data)
             
             if not combined_data:
-                logger.error(f"❌ No hay datos combinados para {symbol}")
-                duration = int(time.time() - start_time)
+                logger.error(f"❌ No hay datos combinados para {symbol} ({start_date} → {end_date})")
                 
-                # ARREGLADO: Usar crypto_id en la actualización
                 self.postgres_manager.update_coingecko_scraping_progress(
                     crypto_id=crypto_id,
                     symbol=symbol,
                     name=nombre,
                     status='error',
-                    notes='No se generaron datos combinados válidos'
+                    notes=f'No se generaron datos combinados para rango {start_date} → {end_date}'
                 )
                 
                 return False
             
-            # Guardar en InfluxDB con esquema específico de CoinGecko
+            # Guardar SOLO en InfluxDB (sin archivos)
             influx_result = {'success': False, 'points_saved': 0}
-            if self.influx_manager.write_api:
-                influx_result = self.influx_manager.save_coingecko_historical_data(crypto, combined_data)
-            
-            # Guardar respaldo JSON
-            backup_success = self.save_crypto_data_backup(symbol, combined_data)
+            if self.influx_manager.client:
+                influx_result = self.influx_manager.save_coingecko_range_data(
+                    crypto, start_date, end_date, combined_data
+                )
             
             duration = int(time.time() - start_time)
             
-            # ARREGLADO: Actualizar estado en PostgreSQL con información detallada usando crypto_id
+            # Calcular nueva fecha más antigua basada en los datos obtenidos
+            if combined_data:
+                # Encontrar el timestamp más antiguo de los datos obtenidos
+                oldest_timestamp = min(item['timestamp'] for item in combined_data if item.get('timestamp'))
+                new_oldest_date = datetime.fromtimestamp(oldest_timestamp / 1000).strftime('%Y-%m-%d')
+                logger.info(f"🕰️ Nueva fecha más antigua encontrada: {new_oldest_date}")
+            else:
+                new_oldest_date = start_date
+            
+            # Actualizar estado en PostgreSQL
             if influx_result.get('success'):
                 self.postgres_manager.update_coingecko_scraping_progress(
                     crypto_id=crypto_id,
@@ -1034,49 +1042,52 @@ class SeleniumCryptoDataScraper:
                     name=nombre,
                     status='completed',
                     total_points=influx_result['points_saved'],
-                    oldest_date=influx_result.get('oldest_date'),
+                    oldest_date=new_oldest_date,  # Actualizar con la fecha más antigua obtenida
                     latest_date=influx_result.get('latest_date'),
-                    notes=f'Descarga exitosa: {influx_result["points_saved"]} puntos, '
-                          f'rango {influx_result.get("date_range_days", 0)} días'
+                    notes=f'Rango histórico exitoso: {influx_result["points_saved"]} puntos, '
+                          f'rango {start_date} → {end_date}, '
+                          f'nueva oldest_date: {new_oldest_date}, duración {duration}s'
                 )
                 
                 logger.info(f"✅ {symbol}: Guardado en InfluxDB ({influx_result['points_saved']} puntos)")
-                logger.info(f"📅 Rango: {influx_result.get('oldest_date')} → {influx_result.get('latest_date')}")
+                logger.info(f"📅 Rango procesado: {start_date} → {end_date}")
+                logger.info(f"🕰️ Oldest_date actualizada a: {new_oldest_date}")
+                logger.info(f"⏱️ Duración: {duration}s")
             else:
                 error_msg = influx_result.get('error', 'Unknown error')
-                # ARREGLADO: Usar crypto_id en la actualización de error
                 self.postgres_manager.update_coingecko_scraping_progress(
                     crypto_id=crypto_id,
                     symbol=symbol,
                     name=nombre,
                     status='error',
-                    notes=f'Error guardando en InfluxDB: {error_msg}'
+                    notes=f'Error guardando rango {start_date} → {end_date} en InfluxDB: {error_msg[:200]}'
                 )
                 
-                logger.warning(f"⚠️ {symbol}: No se pudo guardar en InfluxDB")
+                logger.warning(f"⚠️ {symbol}: No se pudo guardar en InfluxDB: {error_msg}")
             
-            return influx_result.get('success') or backup_success
+            return influx_result.get('success', False)
             
         except Exception as e:
             duration = int(time.time() - start_time)
             error_msg = str(e)[:200]
             
             logger.error(f"❌ Error procesando {symbol}: {e}")
-            # ARREGLADO: Usar crypto_id en la actualización de error
             self.postgres_manager.update_coingecko_scraping_progress(
                 crypto_id=crypto_id,
                 symbol=symbol,
                 name=nombre,
                 status='error',
-                notes=f'Error durante procesamiento: {error_msg}'
+                notes=f'Error durante procesamiento de rango: {error_msg}'
             )
             
             return False
     
     def run(self) -> None:
-        """Ejecuta el proceso completo usando esquema normalizado"""
+        """Ejecuta el proceso completo de rangos SOLO BASE DE DATOS"""
         
-        logger.info(f"🚀 Iniciando scraper CoinGecko con esquema normalizado (VERSIÓN ARREGLADA - None values)")
+        logger.info(f"🚀 Iniciando scraper de rangos CoinGecko con esquema normalizado (SOLO BASE DE DATOS)")
+        logger.info(f"📈 DATOS HISTÓRICOS: Continúa hacia atrás desde oldest_data_fetched de cada crypto")
+        logger.info(f"🔙 LÓGICA: Si crypto tiene oldest_data_fetched, busca {self.range_days} días antes de esa fecha")
         
         # Conectar a bases de datos
         postgres_connected, influx_connected = self.connect_databases()
@@ -1088,7 +1099,7 @@ class SeleniumCryptoDataScraper:
         if influx_connected:
             logger.info("✅ InfluxDB conectado - Los datos se guardarán en InfluxDB")
         else:
-            logger.warning("⚠️ InfluxDB no disponible - Solo se guardarán respaldos JSON y estados en PostgreSQL")
+            logger.warning("⚠️ InfluxDB no disponible - Solo se actualizarán estados en PostgreSQL")
         
         # Cargar criptomonedas CoinGecko desde esquema normalizado
         cryptocurrencies = self.load_cryptocurrencies()
@@ -1101,13 +1112,14 @@ class SeleniumCryptoDataScraper:
         if self.crypto_limit:
             logger.info(f"🔢 Límite aplicado: {self.crypto_limit} criptomonedas")
         
-        logger.info(f"📁 Los archivos de respaldo se guardarán en: {os.path.abspath(self.output_dir)}")
+        logger.info(f"📦 Tamaño de rango: {self.range_days} días hacia atrás desde oldest_data_fetched")
+        logger.info(f"🔙 Cada ejecución busca datos {self.range_days} días antes de la fecha más antigua conocida")
+        logger.info(f"💾 SOLO BASE DE DATOS - Sin archivos CSV/JSON")
         
         # Estadísticas de ejecución
         successful = 0
         failed = 0
         skipped = 0
-        total_points_saved = 0
         
         try:
             for i, crypto in enumerate(cryptocurrencies, 1):
@@ -1117,16 +1129,18 @@ class SeleniumCryptoDataScraper:
                 print(f"\n[{i}/{len(cryptocurrencies)}] {priority} | {status} ", end="")
                 
                 try:
-                    # Decidir si procesar según prioridad
+                    # Decidir si procesar según prioridad HISTÓRICA (hacia atrás en el tiempo)
                     if priority == 'CURRENT' and status == 'completed':
-                        logger.info(f"⏭️ Saltando {crypto.get('simbolo')} - Ya está actualizado")
-                        skipped += 1
-                        continue
+                        oldest_date = crypto.get('oldest_data_fetched')
+                        if oldest_date and oldest_date <= '2020-01-01':
+                            logger.info(f"⏭️ Saltando {crypto.get('simbolo')} - Datos históricos completos hasta {oldest_date}")
+                            skipped += 1
+                            continue
+                        else:
+                            logger.info(f"🔄 Procesando {crypto.get('simbolo')} - Datos históricos incompletos (solo hasta {oldest_date})")
                     
-                    if self.process_cryptocurrency_normalized(crypto):
+                    if self.process_cryptocurrency_ranges_normalized(crypto):
                         successful += 1
-                        # Estimar puntos guardados basado en respuesta
-                        total_points_saved += crypto.get('total_data_points', 0)
                     else:
                         failed += 1
                         
@@ -1134,7 +1148,7 @@ class SeleniumCryptoDataScraper:
                     logger.error(f"❌ Error procesando {crypto.get('nombre', 'Desconocido')}: {e}")
                     failed += 1
                 
-                # Pausa entre criptomonedas para evitar rate limiting
+                # Pausa entre criptomonedas
                 if i < len(cryptocurrencies):
                     self.random_delay(self.delay * 1.5, self.delay * 2.5)
                     
@@ -1144,7 +1158,7 @@ class SeleniumCryptoDataScraper:
             logger.error(f"❌ Error inesperado durante el procesamiento: {e}")
         
         # Estadísticas finales
-        logger.info(f"\n\n📈 === RESUMEN FINAL ===")
+        logger.info(f"\n\n📈 === RESUMEN FINAL (SOLO BASE DE DATOS) ===")
         logger.info(f"✅ Exitosos: {successful}")
         logger.info(f"❌ Fallidos: {failed}")
         logger.info(f"⏭️ Saltados: {skipped}")
@@ -1153,9 +1167,9 @@ class SeleniumCryptoDataScraper:
         if influx_connected:
             logger.info(f"💾 Datos históricos guardados en InfluxDB (bucket: {self.influxdb_config.database})")
         
-        logger.info(f"📁 Respaldos JSON en: {os.path.abspath(self.output_dir)}")
+        logger.info(f"🚫 Sin archivos CSV/JSON - Solo base de datos")
         
-        # Mostrar estadísticas finales usando vistas del esquema normalizado
+        # Mostrar estadísticas finales
         final_stats = self.postgres_manager.get_coingecko_scraping_stats()
         if final_stats:
             logger.info(f"\n📊 === ESTADO FINAL SCRAPING COINGECKO ===")
@@ -1180,10 +1194,11 @@ def main():
     scraper = None
     
     try:
-        print("🚀 === CoinGecko Historical Scraper (ARREGLADO - None values + duplicados) ===")
-        print("Con tracking avanzado y separación por fuentes de datos")
-        print("CORRECCIÓN: Resuelto error de símbolos duplicados usando crypto_id")
-        print("CORRECCIÓN: Manejo robusto de valores None en conversiones numéricas")
+        print("🚀 === CoinGecko Range Scraper (ESQUEMA NORMALIZADO COHERENTE) ===")
+        print("Adaptado al mismo esquema que SeleniumCryptoDataScraper")
+        print("📈 DATOS HISTÓRICOS: Continúa hacia atrás desde oldest_data_fetched de cada crypto")
+        print("🔙 LÓGICA: Busca datos más antiguos partiendo desde donde se quedó cada crypto")
+        print("SOLO BASE DE DATOS - Sin archivos CSV/JSON")
         print("Instalando dependencias:")
         print("pip install selenium webdriver-manager influxdb-client psycopg2-binary")
         print("ChromeDriver se descarga automáticamente\n")
@@ -1194,6 +1209,7 @@ def main():
         # Configuración
         headless = input("¿Ejecutar en modo headless? (s/N): ").lower().startswith('s')
         delay = float(input("Delay entre peticiones en segundos (recomendado: 2-4): ") or "2.5")
+        range_days = int(input("Días hacia atrás desde oldest_data_fetched (recomendado: 30): ") or "30")
         
         # Límite de criptomonedas (opcional)
         limit_input = input("¿Límite de criptomonedas a procesar? (Enter para todas): ").strip()
@@ -1208,19 +1224,19 @@ def main():
         
         try:
             influxdb_config = InfluxDBConfig()
-        except ValueError as e:
+        except Exception as e:
             logger.error(f"❌ Error en configuración de InfluxDB: {e}")
-            logger.info("Continuando solo con PostgreSQL y respaldos JSON...")
+            logger.info("Continuando solo con PostgreSQL...")
             influxdb_config = None
         
         # Crear scraper
-        scraper = SeleniumCryptoDataScraper(
-            output_dir="values",
-            headless=headless,
+        scraper = SeleniumRangeCryptoDataScraper(
             delay=delay,
+            headless=headless,
+            range_days=range_days,
+            crypto_limit=crypto_limit,
             influxdb_config=influxdb_config,
-            postgres_config=postgres_config,
-            crypto_limit=crypto_limit
+            postgres_config=postgres_config
         )
         
         # Ejecutar scraping

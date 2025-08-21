@@ -7,3 +7,5 @@ coingecko_range_scraper.log
 coingecko_scraper.log
 valuesMinutely.py
 .gitignore
+coingecko_historical_normalized.log
+coingecko_range_scraper_normalized.log
