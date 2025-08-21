@@ -144,22 +144,34 @@ class DatabaseManager:
         try:
             with self._lock:
                 with self.pg_conn.cursor() as cursor:
-                    # Preparar datos para inserción batch
-                    crypto_data = []
-                    coingecko_data = []
-                    
+                    # PASO 1: Eliminar duplicados por símbolo en el mismo lote
+                    unique_cryptos = {}
                     for crypto in crypto_list:
                         if not crypto or not crypto.get('symbol'):
                             continue
                         
-                        # Datos para tabla principal cryptos
+                        symbol = crypto.get('symbol', '').upper()
+                        # Mantener el de mejor ranking (menor número = mejor)
+                        if symbol not in unique_cryptos or crypto.get('rank', 9999) < unique_cryptos[symbol].get('rank', 9999):
+                            unique_cryptos[symbol] = crypto
+                    
+                    crypto_list_unique = list(unique_cryptos.values())
+                    
+                    if not crypto_list_unique:
+                        return 0
+                    
+                    print(f"🔄 Procesando {len(crypto_list_unique)} cryptos únicos (eliminados {len(crypto_list) - len(crypto_list_unique)} duplicados)")
+                    
+                    # PASO 2: Preparar datos para inserción batch
+                    crypto_data = []
+                    for crypto in crypto_list_unique:
                         crypto_data.append((
                             crypto.get('name', ''),
                             crypto.get('symbol', ''),
                             crypto.get('slug', '')
                         ))
                     
-                    # Insertar/actualizar cryptos principales usando función optimizada
+                    # PASO 3: Insertar/actualizar cryptos principales usando función optimizada
                     crypto_ids = []
                     for name, symbol, slug in crypto_data:
                         try:
@@ -173,12 +185,22 @@ class DatabaseManager:
                             print(f"⚠️ Error con crypto {symbol}: {e}")
                             crypto_ids.append(None)
                     
-                    # Preparar datos para coingecko_cryptos
-                    for i, crypto in enumerate(crypto_list):
+                    # PASO 4: Preparar datos para coingecko_cryptos SIN DUPLICADOS
+                    coingecko_data = []
+                    processed_crypto_ids = set()
+                    
+                    for i, crypto in enumerate(crypto_list_unique):
                         if i >= len(crypto_ids) or not crypto.get('symbol') or not crypto_ids[i]:
                             continue
                             
                         crypto_id = crypto_ids[i]
+                        
+                        # Verificar que no hayamos procesado este crypto_id ya
+                        if crypto_id in processed_crypto_ids:
+                            print(f"⚠️ Crypto_id {crypto_id} duplicado en lote, saltando...")
+                            continue
+                        
+                        processed_crypto_ids.add(crypto_id)
                         
                         # Extraer tags y badges como JSON compacto
                         tags_json = json.dumps(crypto.get('tags', [])[:5])  # Limitar a 5 tags
@@ -202,7 +224,7 @@ class DatabaseManager:
                             f'Scraped {date.today()}'
                         ))
                     
-                    # Inserción batch optimizada para coingecko_cryptos
+                    # PASO 5: Inserción batch optimizada para coingecko_cryptos
                     if coingecko_data:
                         execute_values(
                             cursor,
@@ -478,19 +500,36 @@ class UltraOptimizedScraper:
             icon_url = ""
             if img:
                 icon_url = img.get('src', '')
-                alt_text = img.get('alt', '').upper()
-                symbol = alt_text.strip()
+                alt_text = img.get('alt', '').upper().strip()
+                symbol = alt_text
 
-            # Extraer nombre del texto del enlace
+            # Extraer nombre del texto del enlace - método mejorado
+            name = ""
+            symbol_from_text = ""
+            
+            # Buscar div con clase específica para el nombre
             name_div = link.find('div', class_=re.compile(r'tw-text-gray-700'))
             if name_div:
-                name = name_div.get_text(strip=True)
+                # Extraer texto completo del nombre
+                name_text = name_div.get_text(strip=True)
+                
                 # Buscar símbolo en la misma estructura
-                symbol_div = name_div.find('div', class_=re.compile(r'tw-text-xs'))
+                symbol_div = name_div.find('div', class_=re.compile(r'tw-text-xs.*tw-text-gray-500'))
                 if symbol_div:
-                    symbol = symbol_div.get_text(strip=True)
+                    symbol_from_text = symbol_div.get_text(strip=True).upper()
+                    # Remover el símbolo del nombre si está incluido
+                    name = name_text.replace(symbol_div.get_text(strip=True), '').strip()
+                else:
+                    name = name_text
             else:
+                # Fallback: usar todo el texto del enlace
                 name = link.get_text(strip=True)
+
+            # Usar el mejor símbolo disponible
+            if symbol_from_text:
+                symbol = symbol_from_text
+            elif not symbol and img:
+                symbol = img.get('alt', '').upper().strip()
 
             # Extraer slug de URL
             slug = ""
@@ -500,12 +539,17 @@ class UltraOptimizedScraper:
                 if coins_idx + 1 < len(path_parts):
                     slug = path_parts[coins_idx + 1]
 
-            # Fallbacks para datos faltantes
-            if not symbol and img:
-                symbol = img.get('alt', f'UNK{rank}').upper()
+            # Validaciones y fallbacks mejorados
+            if not symbol or len(symbol) > 20:
+                print(f"⚠️ Símbolo inválido en rank {rank}: '{symbol}', saltando...")
+                return None
             
-            name = name or symbol or f"Unknown-{rank}"
-            symbol = symbol or f"UNK{rank}"
+            if not name:
+                name = symbol
+            
+            # Limpiar datos
+            name = name.strip()[:255] or f"Unknown-{rank}"
+            symbol = symbol.strip()[:20] or f"UNK{rank}"
             slug = slug or f"coingecko-{symbol.lower()}"
 
             # Extraer precio de la columna 4 (índice 4)
@@ -524,21 +568,30 @@ class UltraOptimizedScraper:
                 percent_text = cells[5].get_text(strip=True)
                 percent_match = self.percent_pattern.search(percent_text)
                 if percent_match:
-                    percent_change_1h = float(percent_match.group(1))
+                    try:
+                        percent_change_1h = float(percent_match.group(1))
+                    except ValueError:
+                        percent_change_1h = 0.0
 
             # 24h % (columna 6)
             if len(cells) > 6:
                 percent_text = cells[6].get_text(strip=True)
                 percent_match = self.percent_pattern.search(percent_text)
                 if percent_match:
-                    percent_change_24h = float(percent_match.group(1))
+                    try:
+                        percent_change_24h = float(percent_match.group(1))
+                    except ValueError:
+                        percent_change_24h = 0.0
 
             # 7d % (columna 7)
             if len(cells) > 7:
                 percent_text = cells[7].get_text(strip=True)
                 percent_match = self.percent_pattern.search(percent_text)
                 if percent_match:
-                    percent_change_7d = float(percent_match.group(1))
+                    try:
+                        percent_change_7d = float(percent_match.group(1))
+                    except ValueError:
+                        percent_change_7d = 0.0
 
             # Extraer volumen 24h (columna 9 aproximadamente)
             volume_24h = 0.0
@@ -552,13 +605,13 @@ class UltraOptimizedScraper:
                 market_cap_text = cells[10].get_text(strip=True)
                 market_cap = self.fast_parse_number(market_cap_text)
 
-            # Construir datos del crypto
+            # Construir datos del crypto con validaciones adicionales
             crypto_data = {
-                'name': name[:255],
-                'symbol': symbol[:20],
-                'slug': slug[:255],
+                'name': name,
+                'symbol': symbol,
+                'slug': slug,
                 'rank': rank,
-                'icon_url': icon_url[:500],
+                'icon_url': icon_url[:500] if icon_url else '',
                 'coin_url': coin_url[:500],
                 'coingecko_url': coin_url[:500],
                 'tags': ['scraped'],
@@ -658,10 +711,11 @@ class UltraOptimizedScraper:
         
         # Variables de control
         current_batch = []
-        batch_size = 1000  # Lotes optimizados
+        batch_size = 500  # Lotes más pequeños para mejor control
         consecutive_failures = 0
         max_failures = 3
         page = 1
+        seen_symbols = set()  # Control global de duplicados
         
         print(f"\n🎯 Iniciando scraping automático...")
         start_time = time.time()
@@ -685,9 +739,25 @@ class UltraOptimizedScraper:
                 # Reset contador de fallos
                 consecutive_failures = 0
                 
-                # Agregar datos
-                all_coins.extend(page_data)
-                current_batch.extend(page_data)
+                # Filtrar duplicados globales
+                filtered_data = []
+                for crypto in page_data:
+                    symbol = crypto.get('symbol', '').upper()
+                    if symbol and symbol not in seen_symbols:
+                        seen_symbols.add(symbol)
+                        filtered_data.append(crypto)
+                    elif symbol:
+                        print(f"🔄 Duplicado global detectado y eliminado: {symbol}")
+                
+                if not filtered_data:
+                    print(f"⚠️ Página {page} sin datos únicos")
+                    page += 1
+                    time.sleep(0.5)
+                    continue
+                
+                # Agregar datos filtrados
+                all_coins.extend(filtered_data)
+                current_batch.extend(filtered_data)
                 
                 # Procesar lote si está lleno
                 if len(current_batch) >= batch_size:
@@ -697,7 +767,7 @@ class UltraOptimizedScraper:
                     # Estadísticas en tiempo real
                     elapsed = time.time() - start_time
                     rate = len(all_coins) / elapsed * 60 if elapsed > 0 else 0
-                    print(f"📊 Total: {len(all_coins):,} | Página {page} | {rate:.0f} cryptos/min")
+                    print(f"📊 Total: {len(all_coins):,} | Página {page} | {rate:.0f} cryptos/min | Únicos: {len(seen_symbols)}")
                 
                 page += 1
                 
@@ -723,6 +793,7 @@ class UltraOptimizedScraper:
         
         print(f"\n🎉 === SCRAPING COMPLETADO ===")
         print(f"📊 Total extraídas: {len(all_coins):,} cryptos")
+        print(f"🔄 Símbolos únicos: {len(seen_symbols):,}")
         print(f"📄 Páginas procesadas: {page-1}")
         print(f"⏱️ Tiempo total: {elapsed:.1f}s")
         print(f"🚀 Velocidad: {rate:.0f} cryptos/minuto")
@@ -753,6 +824,8 @@ def main():
         print("  - Parsing ultra rápido")
         print("  - Scraping automático hasta fallo")
         print("  - Estructura HTML real de CoinGecko")
+        print("  - Control avanzado de duplicados")
+        print("  - Lotes optimizados para BD")
         
         # Verificar dependencias
         check_dependencies()
