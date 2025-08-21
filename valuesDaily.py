@@ -95,7 +95,7 @@ class PostgreSQLConfig:
     host: str = os.getenv('POSTGRES_HOST', 'localhost')
     port: int = int(os.getenv('POSTGRES_EXTERNAL_PORT') or '5432')  # ARREGLADO: Manejar None
     database: str = os.getenv('POSTGRES_DB', 'cryptodb')
-    user: str = os.getenv('POSTGRES_USER', 'crypto_user')
+    user: str = os.getenv('POSTGRES_USER', 'crypto-user')
     password: str = os.getenv('POSTGRES_PASSWORD', 'davisete453')
     
     def __post_init__(self):
@@ -426,31 +426,7 @@ class PostgreSQLManager:
             if self.connection:
                 self.connection.rollback()
     
-    def create_scraping_log_entry(self, crypto_id: int, success: bool, data_points: int = 0, 
-                                date_start: str = None, date_end: str = None, 
-                                error_message: str = None, duration_seconds: int = None):
-        """Crea entrada en log de scraping usando esquema normalizado"""
-        if not self.connection or not self.coingecko_source_id:
-            return
-        
-        try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO crypto_scraping_log (
-                        crypto_id, source_id, date_range_start, date_range_end,
-                        data_points_fetched, fetch_duration_seconds, success, error_message
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    crypto_id, self.coingecko_source_id, date_start, date_end,
-                    data_points, duration_seconds, success, error_message
-                ))
-                self.connection.commit()
-                logger.debug(f"✅ Log de scraping creado para crypto_id {crypto_id}")
-                
-        except Exception as e:
-            logger.error(f"❌ Error creando log de scraping: {e}")
-            if self.connection:
-                self.connection.rollback()
+    
     
     def get_coingecko_scraping_stats(self) -> Dict:
         """Obtiene estadísticas de scraping de CoinGecko usando consultas directas"""
@@ -1011,12 +987,6 @@ class SeleniumCryptoDataScraper:
                     notes='Error obteniendo datos de precios desde CoinGecko'
                 )
                 
-                if crypto_id:
-                    self.postgres_manager.create_scraping_log_entry(
-                        crypto_id, False, 0, None, None, 
-                        'Error obteniendo datos de precios', duration
-                    )
-                
                 return False
             
             # Delay entre peticiones
@@ -1044,12 +1014,6 @@ class SeleniumCryptoDataScraper:
                     notes='No se generaron datos combinados válidos'
                 )
                 
-                if crypto_id:
-                    self.postgres_manager.create_scraping_log_entry(
-                        crypto_id, False, 0, None, None,
-                        'No se generaron datos combinados', duration
-                    )
-                
                 return False
             
             # Guardar en InfluxDB con esquema específico de CoinGecko
@@ -1076,13 +1040,6 @@ class SeleniumCryptoDataScraper:
                           f'rango {influx_result.get("date_range_days", 0)} días'
                 )
                 
-                if crypto_id:
-                    self.postgres_manager.create_scraping_log_entry(
-                        crypto_id, True, influx_result['points_saved'],
-                        influx_result.get('oldest_date'), influx_result.get('latest_date'),
-                        None, duration
-                    )
-                
                 logger.info(f"✅ {symbol}: Guardado en InfluxDB ({influx_result['points_saved']} puntos)")
                 logger.info(f"📅 Rango: {influx_result.get('oldest_date')} → {influx_result.get('latest_date')}")
             else:
@@ -1095,11 +1052,6 @@ class SeleniumCryptoDataScraper:
                     status='error',
                     notes=f'Error guardando en InfluxDB: {error_msg}'
                 )
-                
-                if crypto_id:
-                    self.postgres_manager.create_scraping_log_entry(
-                        crypto_id, False, 0, None, None, error_msg, duration
-                    )
                 
                 logger.warning(f"⚠️ {symbol}: No se pudo guardar en InfluxDB")
             
@@ -1118,11 +1070,6 @@ class SeleniumCryptoDataScraper:
                 status='error',
                 notes=f'Error durante procesamiento: {error_msg}'
             )
-            
-            if crypto_id:
-                self.postgres_manager.create_scraping_log_entry(
-                    crypto_id, False, 0, None, None, error_msg, duration
-                )
             
             return False
     

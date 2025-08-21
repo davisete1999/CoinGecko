@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-CoinGecko Data Scraper - Optimizado para memoria limitada
-Integrado con PostgreSQL usando esquema normalizado optimizado
+CoinGecko Data Scraper - Selenium Ultra Optimizado SIN JavaScript
+VERSIÓN AUTOMATIZADA - Scraping continuo hasta fallo
+Optimización extrema de extracción de filas con BeautifulSoup + Selenium
+
+DEPENDENCIAS:
+pip install psycopg2-binary selenium beautifulsoup4 webdriver-manager
+
+ESTRUCTURA DE BASE DE DATOS:
+- cryptos (tabla principal normalizada)
+- coingecko_cryptos (datos específicos de CoinGecko)
 """
 
 import os
@@ -16,15 +24,43 @@ import time
 import random
 import re
 import uuid
-from urllib.parse import urlparse, urljoin
-
+from urllib.parse import urlparse, urljoin, parse_qs
+import threading
+from queue import Queue, Empty
+from contextlib import contextmanager
+ 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-import pandas as pd
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+
+def check_dependencies():
+    """Verificar que todas las dependencias estén instaladas"""
+    dependencies = {
+        'psycopg2': 'psycopg2-binary',
+        'selenium': 'selenium',
+        'bs4': 'beautifulsoup4',
+        'webdriver_manager': 'webdriver-manager'
+    }
+    
+    missing = []
+    for module, package in dependencies.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(package)
+    
+    if missing:
+        print(f"❌ Dependencias faltantes: {', '.join(missing)}")
+        print(f"💡 Instalar con: pip install {' '.join(missing)}")
+        sys.exit(1)
+    
+    print("✅ Todas las dependencias están instaladas")
 
 def load_env_file(env_file: str = '.env'):
     """Cargar variables de entorno desde archivo .env"""
@@ -54,7 +90,7 @@ class DatabaseConfig:
     postgres_host: str = os.getenv('POSTGRES_HOST', 'localhost')
     postgres_port: int = int(os.getenv('POSTGRES_EXTERNAL_PORT', '5432'))
     postgres_db: str = os.getenv('POSTGRES_DB', 'cryptodb')
-    postgres_user: str = os.getenv('POSTGRES_USER', 'crypto_user')
+    postgres_user: str = 'crypto-user'
     postgres_password: str = os.getenv('POSTGRES_PASSWORD', 'davisete453')
     
     def __post_init__(self):
@@ -62,13 +98,14 @@ class DatabaseConfig:
         print(f"🔧 PostgreSQL Config: {self.postgres_host}:{self.postgres_port}/{self.postgres_db}")
 
 class DatabaseManager:
-    """Manejador de base de datos optimizado para memoria"""
+    """Manejador de base de datos optimizado para la nueva estructura"""
     
     def __init__(self, db_config: DatabaseConfig):
         self.db_config = db_config
         self.pg_conn = None
         self.session_id = str(uuid.uuid4())
         self.coingecko_source_id = None
+        self._lock = threading.Lock()
         
     def connect(self):
         """Conectar a PostgreSQL y obtener IDs de fuentes"""
@@ -97,141 +134,141 @@ class DatabaseManager:
             print(f"❌ Error conectando a PostgreSQL: {e}")
             return False
     
-    def get_or_create_crypto(self, name: str, symbol: str, slug: str = None) -> Optional[int]:
-        """Obtener o crear crypto en tabla principal usando función SQL"""
-        try:
-            with self.pg_conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT get_or_create_crypto(%s, %s, %s)",
-                    (name, symbol, slug)
-                )
-                crypto_id = cursor.fetchone()[0]
-                self.pg_conn.commit()
-                return crypto_id
-        except Exception as e:
-            print(f"❌ Error obteniendo/creando crypto {symbol}: {e}")
-            if self.pg_conn:
-                self.pg_conn.rollback()
-            return None
-    
-    def save_coingecko_crypto(self, crypto_data: Dict[str, Any]) -> Optional[int]:
-        """Guardar crypto en esquema optimizado"""
-        try:
-            # Obtener o crear en tabla principal
-            crypto_id = self.get_or_create_crypto(
-                crypto_data.get('name', ''),
-                crypto_data.get('symbol', ''),
-                crypto_data.get('slug', '')
-            )
-            
-            if not crypto_id:
-                return None
-            
-            # Insertar/actualizar en tabla específica
-            with self.pg_conn.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO coingecko_cryptos (
-                        crypto_id, coingecko_rank, coingecko_url, icon_url, coin_url,
-                        tags, badges, market_pair_count, last_values_update,
-                        oldest_data_fetched, scraping_status, total_data_points,
-                        last_fetch_attempt, fetch_error_count, next_fetch_priority, scraping_notes
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (crypto_id) DO UPDATE SET
-                        coingecko_rank = EXCLUDED.coingecko_rank,
-                        coingecko_url = EXCLUDED.coingecko_url,
-                        icon_url = EXCLUDED.icon_url,
-                        coin_url = EXCLUDED.coin_url,
-                        tags = EXCLUDED.tags,
-                        badges = EXCLUDED.badges,
-                        market_pair_count = EXCLUDED.market_pair_count,
-                        last_values_update = EXCLUDED.last_values_update,
-                        scraping_status = EXCLUDED.scraping_status,
-                        total_data_points = EXCLUDED.total_data_points,
-                        last_fetch_attempt = EXCLUDED.last_fetch_attempt,
-                        scraping_notes = EXCLUDED.scraping_notes,
-                        updated_at = CURRENT_TIMESTAMP
-                """, (
-                    crypto_id,
-                    crypto_data.get('rank', None),
-                    crypto_data.get('coin_url', ''),
-                    crypto_data.get('icon_url', ''),
-                    crypto_data.get('coin_url', ''),
-                    json.dumps(crypto_data.get('tags', [])),  # JSON string para reducir memoria
-                    json.dumps(crypto_data.get('badges', [])),  # JSON string para reducir memoria
-                    crypto_data.get('market_pair_count', None),
-                    date.today(),
-                    None,
-                    'completed',
-                    1,
-                    datetime.now(timezone.utc),
-                    0,
-                    100,
-                    f'Scraped {date.today()}'
-                ))
-                
-                # Crear log de scraping con menor información para optimizar memoria
-                self.create_scraping_log(crypto_id, 1, True)
-                
-                self.pg_conn.commit()
-                return crypto_id
-                
-        except Exception as e:
-            print(f"❌ Error guardando crypto {crypto_data.get('symbol', 'UNKNOWN')}: {e}")
-            if self.pg_conn:
-                self.pg_conn.rollback()
-            return None
-    
-    def create_scraping_log(self, crypto_id: int, data_points: int, success: bool, error_message: str = None):
-        """Crear entrada en el log de scraping"""
-        try:
-            with self.pg_conn.cursor() as cursor:
-                cursor.execute(
-                    """INSERT INTO crypto_scraping_log 
-                       (crypto_id, source_id, session_id, date_range_start, date_range_end, 
-                        data_points_fetched, success, error_message)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (crypto_id, self.coingecko_source_id, self.session_id, date.today(), date.today(), 
-                     data_points, success, error_message)
-                )
-        except Exception:
-            pass  # Silencioso para reducir ruido
-    
     def save_crypto_batch(self, crypto_list: List[Dict[str, Any]]) -> int:
-        """Guardar lote de cryptos de forma optimizada"""
+        """Guardar lote de cryptos usando la nueva estructura normalizada"""
+        if not crypto_list or not self.pg_conn:
+            return 0
+        
         saved_count = 0
         
-        if not crypto_list or not self.pg_conn:
-            return saved_count
-        
         try:
-            for crypto_data in crypto_list:
-                if crypto_data:
-                    crypto_id = self.save_coingecko_crypto(crypto_data)
-                    if crypto_id:
-                        saved_count += 1
-            
-            print(f"✅ Guardado lote de {saved_count}/{len(crypto_list)} cryptos")
-            
+            with self._lock:
+                with self.pg_conn.cursor() as cursor:
+                    # Preparar datos para inserción batch
+                    crypto_data = []
+                    coingecko_data = []
+                    
+                    for crypto in crypto_list:
+                        if not crypto or not crypto.get('symbol'):
+                            continue
+                        
+                        # Datos para tabla principal cryptos
+                        crypto_data.append((
+                            crypto.get('name', ''),
+                            crypto.get('symbol', ''),
+                            crypto.get('slug', '')
+                        ))
+                    
+                    # Insertar/actualizar cryptos principales usando función optimizada
+                    crypto_ids = []
+                    for name, symbol, slug in crypto_data:
+                        try:
+                            cursor.execute(
+                                "SELECT get_or_create_crypto(%s, %s, %s)",
+                                (name, symbol, slug)
+                            )
+                            crypto_id = cursor.fetchone()[0]
+                            crypto_ids.append(crypto_id)
+                        except Exception as e:
+                            print(f"⚠️ Error con crypto {symbol}: {e}")
+                            crypto_ids.append(None)
+                    
+                    # Preparar datos para coingecko_cryptos
+                    for i, crypto in enumerate(crypto_list):
+                        if i >= len(crypto_ids) or not crypto.get('symbol') or not crypto_ids[i]:
+                            continue
+                            
+                        crypto_id = crypto_ids[i]
+                        
+                        # Extraer tags y badges como JSON compacto
+                        tags_json = json.dumps(crypto.get('tags', [])[:5])  # Limitar a 5 tags
+                        badges_json = json.dumps(crypto.get('badges', [])[:3])  # Limitar a 3 badges
+                        
+                        coingecko_data.append((
+                            crypto_id,
+                            crypto.get('rank'),
+                            crypto.get('coingecko_url', ''),
+                            crypto.get('icon_url', ''),
+                            crypto.get('coin_url', ''),
+                            tags_json,
+                            badges_json,
+                            crypto.get('market_pair_count'),
+                            date.today(),
+                            'completed',
+                            1,
+                            datetime.now(timezone.utc),
+                            0,
+                            100,
+                            f'Scraped {date.today()}'
+                        ))
+                    
+                    # Inserción batch optimizada para coingecko_cryptos
+                    if coingecko_data:
+                        execute_values(
+                            cursor,
+                            """
+                            INSERT INTO coingecko_cryptos (
+                                crypto_id, coingecko_rank, coingecko_url, icon_url, coin_url,
+                                tags, badges, market_pair_count, last_values_update,
+                                scraping_status, total_data_points, last_fetch_attempt,
+                                fetch_error_count, next_fetch_priority, scraping_notes
+                            ) VALUES %s
+                            ON CONFLICT (crypto_id) DO UPDATE SET
+                                coingecko_rank = EXCLUDED.coingecko_rank,
+                                coingecko_url = EXCLUDED.coingecko_url,
+                                icon_url = EXCLUDED.icon_url,
+                                coin_url = EXCLUDED.coin_url,
+                                tags = EXCLUDED.tags,
+                                badges = EXCLUDED.badges,
+                                market_pair_count = EXCLUDED.market_pair_count,
+                                last_values_update = EXCLUDED.last_values_update,
+                                scraping_status = EXCLUDED.scraping_status,
+                                total_data_points = EXCLUDED.total_data_points,
+                                last_fetch_attempt = EXCLUDED.last_fetch_attempt,
+                                scraping_notes = EXCLUDED.scraping_notes,
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            coingecko_data,
+                            template=None,
+                            page_size=100
+                        )
+                        
+                        saved_count = len(coingecko_data)
+                    
+                    self.pg_conn.commit()
+                    print(f"✅ Guardado lote de {saved_count}/{len(crypto_list)} cryptos")
+                    
         except Exception as e:
             print(f"❌ Error guardando lote: {e}")
             if self.pg_conn:
                 self.pg_conn.rollback()
+            saved_count = 0
         
         return saved_count
     
     def get_existing_cryptos(self) -> Dict[str, int]:
-        """Obtener mapa de símbolos existentes"""
+        """Obtener mapa de símbolos existentes usando vista materializada"""
         try:
             with self.pg_conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT c.symbol, c.id 
-                    FROM cryptos c 
-                    JOIN coingecko_cryptos cg ON c.id = cg.crypto_id 
-                    WHERE c.is_active = true
+                    SELECT symbol, id 
+                    FROM mv_active_cryptos 
+                    WHERE in_coingecko = true
                 """)
                 return {row[0]: row[1] for row in cursor.fetchall()}
         except Exception:
-            return {}
+            # Fallback a consulta normal
+            try:
+                with self.pg_conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT c.symbol, c.id 
+                        FROM cryptos c 
+                        JOIN coingecko_cryptos cg ON c.id = cg.crypto_id 
+                        WHERE c.is_active = true
+                    """)
+                    return {row[0]: row[1] for row in cursor.fetchall()}
+            except Exception:
+                return {}
     
     def close(self):
         """Cerrar conexión"""
@@ -239,43 +276,49 @@ class DatabaseManager:
             self.pg_conn.close()
             print("🔐 Conexión PostgreSQL cerrada")
 
-class CoinGeckoScraper:
-    """Scraper de CoinGecko optimizado para memoria"""
+class WebDriverPool:
+    """Pool de WebDrivers para scraping paralelo sin JS"""
     
-    def __init__(self, headless=True, delay=1, db_config: DatabaseConfig = None):
-        self.base_url = "https://www.coingecko.com"
-        self.delay = delay
-        self.driver = None
-        self.db_config = db_config or DatabaseConfig()
-        self.db_manager = DatabaseManager(self.db_config)
-        
-        self.setup_driver(headless)
+    def __init__(self, pool_size: int = 2):
+        self.pool_size = pool_size
+        self.drivers = Queue()
+        self.active_drivers = []
+        self._create_drivers()
     
-    def setup_driver(self, headless=True):
-        """Configura el driver de Chrome optimizado para memoria"""
+    def _create_driver(self) -> webdriver.Chrome:
+        """Crear un WebDriver optimizado SIN JavaScript"""
         chrome_options = Options()
         
-        if headless:
-            chrome_options.add_argument("--headless")
-        
-        # Optimizaciones de memoria
+        # Configuración base ultra optimizada
+        chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--disable-plugins")
+        chrome_options.add_argument("--disable-javascript")  # CLAVE para velocidad
         chrome_options.add_argument("--disable-images")
-        chrome_options.add_argument("--disable-javascript")  # Solo para páginas estáticas
-        chrome_options.add_argument("--memory-pressure-off")
-        chrome_options.add_argument("--max_old_space_size=512")
-        chrome_options.add_argument("--window-size=1024,768")  # Tamaño reducido
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-background-networking")
+        chrome_options.add_argument("--disable-background-sync")
+        chrome_options.add_argument("--disable-features=TranslateUI,sync")
+        chrome_options.add_argument("--window-size=800,600")  # Tamaño mínimo
+        chrome_options.add_argument("--disable-logging")
+        chrome_options.add_argument("--silent")
+        
+        # User agent minimalista
         chrome_options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
         
-        # Deshabilitar funciones para ahorrar memoria
+        # Deshabilitar recursos no esenciales
         prefs = {
             "profile.managed_default_content_settings.images": 2,
             "profile.managed_default_content_settings.media_stream": 2,
             "profile.managed_default_content_settings.notifications": 2,
+            "profile.managed_default_content_settings.stylesheets": 1,
+            "profile.managed_default_content_settings.javascript": 2,
+            "profile.managed_default_content_settings.plugins": 2,
+            "profile.managed_default_content_settings.popups": 2,
+            "profile.managed_default_content_settings.geolocation": 2,
         }
         chrome_options.add_experimental_option("prefs", prefs)
         
@@ -284,14 +327,69 @@ class CoinGeckoScraper:
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
         try:
-            self.driver = webdriver.Chrome(options=chrome_options)
-            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            print("✅ Driver de Chrome optimizado configurado")
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # Timeouts ultra agresivos para velocidad
+            driver.set_page_load_timeout(15)  # Incrementado para estabilidad
+            driver.implicitly_wait(2)  # Incrementado para estabilidad
+            
+            return driver
+            
         except Exception as e:
-            print(f"❌ Error configurando Chrome driver: {e}")
+            print(f"❌ Error creando WebDriver: {e}")
             raise
     
-    def connect_databases(self):
+    def _create_drivers(self):
+        """Crear pool de drivers"""
+        print(f"🔧 Creando pool de {self.pool_size} WebDrivers ultra optimizados...")
+        
+        for i in range(self.pool_size):
+            try:
+                driver = self._create_driver()
+                self.drivers.put(driver)
+                self.active_drivers.append(driver)
+                print(f"✅ WebDriver {i+1}/{self.pool_size} creado")
+            except Exception as e:
+                print(f"❌ Error creando WebDriver {i+1}: {e}")
+    
+    @contextmanager
+    def get_driver(self):
+        """Context manager para obtener un driver del pool"""
+        driver = None
+        try:
+            driver = self.drivers.get(timeout=30)
+            yield driver
+        finally:
+            if driver:
+                self.drivers.put(driver)
+    
+    def close_all(self):
+        """Cerrar todos los drivers"""
+        print("🔐 Cerrando pool de WebDrivers...")
+        for driver in self.active_drivers:
+            try:
+                driver.quit()
+            except:
+                pass
+        self.active_drivers.clear()
+
+class UltraOptimizedScraper:
+    """Scraper ultra optimizado con BeautifulSoup + Selenium"""
+    
+    def __init__(self, db_config: DatabaseConfig = None):
+        self.base_url = "https://www.coingecko.com"
+        self.db_config = db_config or DatabaseConfig()
+        self.db_manager = DatabaseManager(self.db_config)
+        self.driver_pool = WebDriverPool(pool_size=2)
+        
+        # Patrones regex precompilados para máxima velocidad
+        self.symbol_pattern = re.compile(r'\b([A-Z0-9$.-]{1,15})\b')
+        self.price_pattern = re.compile(r'\$[\d,]+\.?\d*')
+        self.percent_pattern = re.compile(r'([-+]?\d+\.?\d*)%')
+        self.number_pattern = re.compile(r'[\d,]+\.?\d*[BbMmKkTt]?')
+        
+    def connect_database(self):
         """Establecer conexión a PostgreSQL"""
         try:
             if not self.db_manager.connect():
@@ -301,560 +399,397 @@ class CoinGeckoScraper:
             print(f"❌ Error conectando a base de datos: {e}")
             raise
     
-    def random_delay(self, min_delay=0.5, max_delay=1.5):
-        """Delay aleatorio optimizado"""
-        delay = random.uniform(min_delay, max_delay)
-        time.sleep(delay)
-    
-    def get_page(self, url, wait_time=5):
-        """Navega a una URL de forma optimizada"""
-        try:
-            self.driver.get(url)
-            WebDriverWait(self.driver, wait_time).until(
-                EC.presence_of_element_located((By.TAG_NAME, "table"))
-            )
-            return True
-        except TimeoutException:
-            print(f"❌ Timeout cargando: {url}")
-            return False
-        except Exception as e:
-            print(f"❌ Error cargando {url}: {e}")
-            return False
-    
-    def get_total_cryptocurrencies(self) -> int:
-        """Obtiene el total de criptomonedas de forma optimizada"""
-        selectors = [
-            "span.tw-text-sm",
-            "span.text-sm", 
-            ".tw-text-sm",
-            "span[class*='text-sm']"
-        ]
-        
-        for selector in selectors:
-            try:
-                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                
-                for element in elements:
-                    text = element.text.strip()
-                    
-                    if any(keyword in text.lower() for keyword in ['coin', 'crypto', 'total']):
-                        numbers = re.findall(r'\d{1,3}(?:,\d{3})*', text)
-                        if numbers:
-                            for num_str in sorted(numbers, key=len, reverse=True):
-                                try:
-                                    num = int(num_str.replace(',', ''))
-                                    if 100 <= num <= 50000:
-                                        print(f"✅ Total encontrado: {num} cryptos")
-                                        return num
-                                except ValueError:
-                                    continue
-            except Exception:
-                continue
-        
-        # Fallback
-        try:
-            table = self.driver.find_element(By.TAG_NAME, "table")
-            rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
-            if len(rows) > 0:
-                estimated_total = len(rows) * 50
-                print(f"⚠️ Estimando {estimated_total} basado en {len(rows)} filas")
-                return estimated_total
-        except Exception:
-            pass
-        
-        print("⚠️ Usando fallback de 2000 cryptos")
-        return 2000
-    
-    def is_page_empty(self) -> bool:
-        """Verifica si la página está vacía de forma optimizada"""
-        try:
-            table = self.driver.find_element(By.TAG_NAME, "table")
-            rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
-            
-            if len(rows) == 0:
-                return True
-            
-            # Verificar solo las primeras 3 filas para ahorrar tiempo
-            valid_rows = 0
-            for row in rows[:3]:
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) >= 3:
-                    for cell in cells:
-                        if any(indicator in cell.text.lower() for indicator in ['$', 'btc', 'eth', '%']):
-                            valid_rows += 1
-                            break
-            
-            return valid_rows == 0
-            
-        except Exception:
-            return True
-    
-    def parse_number(self, text: str) -> float:
-        """Parsear números de forma optimizada"""
-        if not text or text.strip() in ['--', '-', 'N/A', '']:
+    def fast_parse_number(self, text: str) -> float:
+        """Parser de números ultra optimizado con regex precompilado"""
+        if not text or text in ['--', '-', 'N/A', '', '∞']:
             return 0.0
         
         try:
-            clean_text = text.strip().replace('$', '').replace(',', '').replace('%', '')
+            # Limpiar y extraer número
+            clean_text = text.replace('$', '').replace(',', '').replace('%', '').strip()
             
+            # Detectar multiplicadores
             multiplier = 1
-            if clean_text.endswith('B'):
+            if clean_text.endswith(('T', 't')):
+                multiplier = 1_000_000_000_000
+                clean_text = clean_text[:-1]
+            elif clean_text.endswith(('B', 'b')):
                 multiplier = 1_000_000_000
                 clean_text = clean_text[:-1]
-            elif clean_text.endswith('M'):
+            elif clean_text.endswith(('M', 'm')):
                 multiplier = 1_000_000
                 clean_text = clean_text[:-1]
-            elif clean_text.endswith('K'):
+            elif clean_text.endswith(('K', 'k')):
                 multiplier = 1_000
                 clean_text = clean_text[:-1]
             
-            return float(clean_text) * multiplier
+            # Extraer número con regex
+            number_match = re.search(r'[\d.]+', clean_text)
+            if number_match:
+                return float(number_match.group()) * multiplier
+            return 0.0
             
         except (ValueError, AttributeError):
             return 0.0
     
-    def extract_coins_from_page(self):
-        """Extrae datos de la página de forma optimizada"""
-        coins_data = []
-        
+    def extract_crypto_data_optimized(self, soup_row, expected_rank: int) -> Optional[Dict[str, Any]]:
+        """Extracción ultra optimizada usando BeautifulSoup basada en la estructura real de CoinGecko"""
         try:
-            table = WebDriverWait(self.driver, 5).until(
-                EC.presence_of_element_located((By.TAG_NAME, "table"))
-            )
-            
-            rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
-            
-            for i, row in enumerate(rows):
-                try:
-                    coin_data = self.extract_coin_from_row(row, i + 1)
-                    if coin_data:
-                        coins_data.append(coin_data)
-                except Exception:
-                    continue
-            
-            print(f"✅ Extraídos {len(coins_data)} cryptos de la página")
-            return coins_data
-            
-        except Exception as e:
-            print(f"❌ Error extrayendo datos: {e}")
-            return []
-    
-    def extract_coin_from_row(self, row, rank: int):
-        """Extrae datos de una fila de forma optimizada"""
-        try:
-            cells = row.find_elements(By.TAG_NAME, "td")
-            if len(cells) < 6:
+            # Buscar todas las celdas de una vez
+            cells = soup_row.find_all('td')
+            if len(cells) < 8:  # Mínimo esperado: star, rank, coin, ads, price, 1h, 24h, 7d
                 return None
 
-            # Obtener enlace principal
-            link_element = None
-            for cell_idx in [1, 2]:
-                try:
-                    link_element = cells[cell_idx].find_element(By.CSS_SELECTOR, "a")
-                    break
-                except NoSuchElementException:
-                    continue
-            
-            if not link_element:
+            # Estructura de columnas basada en el HTML real:
+            # 0: Favorito (estrella)
+            # 1: Ranking (#)
+            # 2: Coin (nombre, símbolo, imagen)
+            # 3: Ads (Buy button)
+            # 4: Price
+            # 5: 1h %
+            # 6: 24h %
+            # 7: 7d %
+            # 8: 30d % (hidden)
+            # 9: 24h Volume
+            # 10: Market Cap
+            # 11: FDV (hidden)
+            # 12: Market Cap / FDV (hidden)
+            # 13: Last 7 Days (chart)
+
+            # Extraer ranking de la columna 1
+            rank_text = cells[1].get_text(strip=True)
+            try:
+                rank = int(rank_text)
+            except (ValueError, IndexError):
+                rank = expected_rank
+
+            # Extraer datos de la moneda de la columna 2
+            coin_cell = cells[2]
+            link = coin_cell.find('a')
+            if not link:
                 return None
 
-            raw_href = link_element.get_attribute("href") or ""
-            coin_url = urljoin(self.base_url, raw_href)
-
-            # Extraer symbol del alt de imagen
-            icon_url = ""
+            href = link.get('href', '')
+            coin_url = urljoin(self.base_url, href)
+            
+            # Extraer imagen y símbolo
+            img = link.find('img')
             symbol = ""
-            try:
-                img_element = link_element.find_element(By.TAG_NAME, "img")
-                icon_url = img_element.get_attribute("src") or ""
-                alt = (img_element.get_attribute("alt") or "").strip()
-                alt_clean = re.sub(r"[^A-Za-z0-9.$-]", "", alt)
-                if 1 <= len(alt_clean) <= 15:
-                    symbol = alt_clean.upper()
-            except NoSuchElementException:
-                pass
+            icon_url = ""
+            if img:
+                icon_url = img.get('src', '')
+                alt_text = img.get('alt', '').upper()
+                symbol = alt_text.strip()
 
-            # Extraer nombre (texto directo sin badge)
-            name = ""
-            try:
-                name_block = link_element.find_element(By.XPATH, ".//*[contains(@class,'font-semibold')][1]")
-                name = self.driver.execute_script(
-                    "return (function(el){"
-                    "  var t='';"
-                    "  for (var i=0;i<el.childNodes.length;i++){"
-                    "    var n=el.childNodes[i];"
-                    "    if (n.nodeType===Node.TEXT_NODE){ t += n.textContent; }"
-                    "  }"
-                    "  return t.trim();"
-                    "})(arguments[0]);",
-                    name_block
-                ) or ""
-            except Exception:
-                link_text = (link_element.text or "").strip()
-                if symbol:
-                    link_text = re.sub(rf"\b{re.escape(symbol)}\b", "", link_text)
-                name = next((ln.strip() for ln in link_text.splitlines() if ln.strip()), "")
+            # Extraer nombre del texto del enlace
+            name_div = link.find('div', class_=re.compile(r'tw-text-gray-700'))
+            if name_div:
+                name = name_div.get_text(strip=True)
+                # Buscar símbolo en la misma estructura
+                symbol_div = name_div.find('div', class_=re.compile(r'tw-text-xs'))
+                if symbol_div:
+                    symbol = symbol_div.get_text(strip=True)
+            else:
+                name = link.get_text(strip=True)
 
-            # Fallback de symbol
-            if not symbol:
-                try:
-                    smalls = link_element.find_elements(By.XPATH, ".//*[contains(@class,'text-xs')]")
-                    for sm in smalls:
-                        cand = re.sub(r"[^A-Za-z0-9.$-]", "", (sm.text or "").strip())
-                        if 1 <= len(cand) <= 15 and cand.upper() != (name or "").upper():
-                            symbol = cand.upper()
-                            break
-                except Exception:
-                    pass
-
-            name = name or ""
-            symbol = symbol or ""
-
-            # Extraer slug del URL
+            # Extraer slug de URL
             slug = ""
-            try:
-                p = urlparse(coin_url)
-                parts = [seg for seg in p.path.split("/") if seg]
-                if parts:
-                    if len(parts[0]) <= 5 and re.match(r"^[a-z]{2}(-[a-z]{2})?$", parts[0], re.I):
-                        parts = parts[1:]
-                    if parts and parts[0].lower() in {"coins", "monedas", "moedas", "monete", "monnaies"}:
-                        parts = parts[1:]
-                    slug = parts[0] if parts else ""
-            except Exception:
-                pass
+            path_parts = [p for p in href.split('/') if p and not p.startswith('en')]
+            if path_parts and 'coins' in path_parts:
+                coins_idx = path_parts.index('coins')
+                if coins_idx + 1 < len(path_parts):
+                    slug = path_parts[coins_idx + 1]
 
-            # Extraer datos numéricos de forma optimizada
+            # Fallbacks para datos faltantes
+            if not symbol and img:
+                symbol = img.get('alt', f'UNK{rank}').upper()
+            
+            name = name or symbol or f"Unknown-{rank}"
+            symbol = symbol or f"UNK{rank}"
+            slug = slug or f"coingecko-{symbol.lower()}"
+
+            # Extraer precio de la columna 4 (índice 4)
             price = 0.0
-            volume_24h = 0.0
-            market_cap = 0.0
+            if len(cells) > 4:
+                price_text = cells[4].get_text(strip=True)
+                price = self.fast_parse_number(price_text)
+
+            # Extraer cambios porcentuales
+            percent_change_1h = 0.0
             percent_change_24h = 0.0
+            percent_change_7d = 0.0
 
-            try:
-                # Buscar precio
-                for cell_idx in [2, 3, 4]:
-                    if cell_idx < len(cells):
-                        cell_text = (cells[cell_idx].text or "").strip()
-                        if ("$" in cell_text or "US$" in cell_text) and price == 0.0:
-                            price = self.parse_number(cell_text)
-                            break
+            # 1h % (columna 5)
+            if len(cells) > 5:
+                percent_text = cells[5].get_text(strip=True)
+                percent_match = self.percent_pattern.search(percent_text)
+                if percent_match:
+                    percent_change_1h = float(percent_match.group(1))
 
-                # Buscar porcentaje
-                for cell_idx in range(len(cells)):
-                    cell_text = (cells[cell_idx].text or "").strip()
-                    if "%" in cell_text and percent_change_24h == 0.0:
-                        percent_change_24h = self.parse_number(cell_text)
-                        break
+            # 24h % (columna 6)
+            if len(cells) > 6:
+                percent_text = cells[6].get_text(strip=True)
+                percent_match = self.percent_pattern.search(percent_text)
+                if percent_match:
+                    percent_change_24h = float(percent_match.group(1))
 
-                # Buscar market cap y volumen
-                for cell_idx in range(len(cells)):
-                    cell_text = (cells[cell_idx].text or "").strip()
-                    if "$" in cell_text or "US$" in cell_text:
-                        parsed_value = self.parse_number(cell_text)
-                        if parsed_value > 1_000_000 and market_cap == 0.0:
-                            market_cap = parsed_value
-                        elif parsed_value > 100_000 and volume_24h == 0.0:
-                            volume_24h = parsed_value
-            except Exception:
-                pass
+            # 7d % (columna 7)
+            if len(cells) > 7:
+                percent_text = cells[7].get_text(strip=True)
+                percent_match = self.percent_pattern.search(percent_text)
+                if percent_match:
+                    percent_change_7d = float(percent_match.group(1))
 
-            coin_data = {
-                'name': name,
-                'symbol': symbol,
-                'slug': slug or (f"coingecko-{symbol.lower()}" if symbol else f"unknown-{rank}"),
+            # Extraer volumen 24h (columna 9 aproximadamente)
+            volume_24h = 0.0
+            if len(cells) > 9:
+                volume_text = cells[9].get_text(strip=True)
+                volume_24h = self.fast_parse_number(volume_text)
+
+            # Extraer market cap (columna 10 aproximadamente)
+            market_cap = 0.0
+            if len(cells) > 10:
+                market_cap_text = cells[10].get_text(strip=True)
+                market_cap = self.fast_parse_number(market_cap_text)
+
+            # Construir datos del crypto
+            crypto_data = {
+                'name': name[:255],
+                'symbol': symbol[:20],
+                'slug': slug[:255],
                 'rank': rank,
-                'icon_url': icon_url,
-                'coin_url': coin_url,
-                'tags': ['coingecko-scraped'],  # Reducido para memoria
-                'badges': ['live-data'] if price > 0 else ['scraped'],
+                'icon_url': icon_url[:500],
+                'coin_url': coin_url[:500],
+                'coingecko_url': coin_url[:500],
+                'tags': ['scraped'],
+                'badges': ['live'] if price > 0 else [],
                 'market_pair_count': None,
-                'source': 'coingecko',
-                'is_active': True,
-                'extracted_at': datetime.now(timezone.utc),
-                'quote': {
-                    'price': price,
-                    'volume_24h': volume_24h,
-                    'market_cap': market_cap,
-                    'percent_change_1h': 0.0,
-                    'percent_change_24h': percent_change_24h,
-                    'percent_change_7d': 0.0,
-                    'last_updated': datetime.now(timezone.utc)
-                } if price > 0 else None
+                'price': price,
+                'volume_24h': volume_24h,
+                'market_cap': market_cap,
+                'percent_change_1h': percent_change_1h,
+                'percent_change_24h': percent_change_24h,
+                'percent_change_7d': percent_change_7d,
+                'extracted_at': datetime.now(timezone.utc)
             }
 
-            return coin_data
+            return crypto_data
 
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Error extrayendo crypto {expected_rank}: {str(e)[:50]}")
             return None
     
-    def scrape_pages(self, max_pages=None, items_per_page=100):
-        """Scrapea múltiples páginas de forma optimizada"""
-        all_coins = []
-        consecutive_errors = 0
-        max_consecutive_errors = 3
+    def scrape_page_ultra_fast(self, page: int) -> List[Dict[str, Any]]:
+        """Scraping ultra rápido de una página con BeautifulSoup + Selenium"""
+        # Modificar URL para usar parámetros correctos
+        url = f"{self.base_url}/?page={page}&items=100"
         
-        print(f"🚀 Iniciando scraping {'de todas las páginas' if max_pages is None else f'de {max_pages} páginas'}")
-        
-        # Conectar a base de datos
         try:
-            self.connect_databases()
+            with self.driver_pool.get_driver() as driver:
+                print(f"🚀 Página {page}...", end='', flush=True)
+                
+                # Cargar página
+                driver.get(url)
+                
+                # Esperar tabla con más tiempo
+                try:
+                    WebDriverWait(driver, 15).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "table[data-coin-table-target='table']"))
+                    )
+                    # Esperar a que se carguen las filas
+                    WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "tbody tr"))
+                    )
+                except TimeoutException:
+                    print(f" ❌ Timeout esperando tabla")
+                    return []
+                
+                # Obtener HTML y usar BeautifulSoup para parsing ultra rápido
+                page_source = driver.page_source
+                soup = BeautifulSoup(page_source, 'html.parser')
+                
+                # Encontrar tabla específica
+                table = soup.find('table', {'data-coin-table-target': 'table'})
+                if not table:
+                    print(f" ❌ Sin tabla específica")
+                    return []
+                
+                tbody = table.find('tbody')
+                if not tbody:
+                    print(f" ❌ Sin tbody")
+                    return []
+                
+                rows = tbody.find_all('tr')
+                if not rows:
+                    print(f" ❌ Sin filas")
+                    return []
+                
+                # Procesar todas las filas de una vez
+                coins_data = []
+                expected_rank = (page - 1) * 100 + 1
+                
+                for i, row in enumerate(rows):
+                    coin_data = self.extract_crypto_data_optimized(row, expected_rank + i)
+                    if coin_data:
+                        coins_data.append(coin_data)
+                
+                print(f" ✅ {len(coins_data)} cryptos")
+                return coins_data
+                
         except Exception as e:
-            print(f"❌ No se pudo conectar a la base de datos: {e}")
+            print(f" ❌ Error: {str(e)[:50]}")
+            return []
+    
+    def scrape_all_pages_until_fail(self) -> List[Dict[str, Any]]:
+        """Scraping automático hasta fallo - SIN OPCIONES"""
+        all_coins = []
+        
+        print("🚀 === SCRAPING AUTOMÁTICO ULTRA OPTIMIZADO ===")
+        print("⚡ Scraping continuo hasta fallo detectado")
+        print("🔧 BeautifulSoup + Selenium sin JS")
+        print("💾 Solo PostgreSQL - Sin archivos")
+        
+        # Conectar base de datos
+        try:
+            self.connect_database()
+        except Exception as e:
+            print(f"❌ Error BD: {e}")
             return []
         
-        # Obtener cryptos existentes para evitar duplicados
-        existing_cryptos = self.db_manager.get_existing_cryptos()
-        print(f"📊 Encontradas {len(existing_cryptos)} cryptos existentes")
-        
+        # Variables de control
+        current_batch = []
+        batch_size = 1000  # Lotes optimizados
+        consecutive_failures = 0
+        max_failures = 3
         page = 1
-        while True:
+        
+        print(f"\n🎯 Iniciando scraping automático...")
+        start_time = time.time()
+        
+        while consecutive_failures < max_failures:
             try:
-                if max_pages is not None and page > max_pages:
-                    print(f"🏁 Alcanzado límite de {max_pages} páginas")
-                    break
+                page_data = self.scrape_page_ultra_fast(page)
                 
-                url = f"{self.base_url}/es?page={page}&items={items_per_page}"
-                
-                if self.get_page(url):
-                    if self.is_page_empty():
-                        print(f"📄 Página {page} vacía - Fin del scraping")
+                if not page_data:
+                    consecutive_failures += 1
+                    print(f"⚠️ Fallo {consecutive_failures}/{max_failures} en página {page}")
+                    
+                    if consecutive_failures >= max_failures:
+                        print(f"🛑 Límite de fallos alcanzado - Finalizando")
                         break
                     
-                    coins_data = self.extract_coins_from_page()
-                    
-                    if not coins_data:
-                        consecutive_errors += 1
-                        if consecutive_errors >= max_consecutive_errors:
-                            print(f"❌ {consecutive_errors} errores consecutivos - Terminando")
-                            break
-                        page += 1
-                        continue
-                    
-                    consecutive_errors = 0
-                    
-                    # Filtrar cryptos nuevas
-                    new_coins = [
-                        coin for coin in coins_data 
-                        if coin and coin.get('symbol') not in existing_cryptos
-                    ]
-                    
-                    all_coins.extend(coins_data)
-                    
-                    print(f"📄 Página {page}: {len(coins_data)} total, {len(new_coins)} nuevas")
-                    
-                    # Guardar en PostgreSQL
-                    if coins_data and self.db_manager.pg_conn:
-                        try:
-                            saved_count = self.db_manager.save_crypto_batch(coins_data)
-                            
-                            # Actualizar mapa de existentes
-                            for coin in coins_data:
-                                if coin and coin.get('symbol'):
-                                    existing_cryptos[coin['symbol']] = coin.get('rank', 0)
-                            
-                        except Exception as e:
-                            print(f"❌ Error guardando página {page}: {e}")
-                    
-                    # Verificar si página incompleta indica final
-                    if len(coins_data) < items_per_page:
-                        print(f"🏁 Página {page} tiene solo {len(coins_data)} elementos - Posible fin")
-                    
-                    # Delay muy reducido para velocidad
-                    if self.delay > 0:
-                        self.random_delay(0.2, 0.5)
                     page += 1
+                    time.sleep(1)  # Pausa en fallo
+                    continue
+                
+                # Reset contador de fallos
+                consecutive_failures = 0
+                
+                # Agregar datos
+                all_coins.extend(page_data)
+                current_batch.extend(page_data)
+                
+                # Procesar lote si está lleno
+                if len(current_batch) >= batch_size:
+                    saved_count = self.db_manager.save_crypto_batch(current_batch)
+                    current_batch = []
                     
-                else:
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        print(f"❌ {consecutive_errors} errores consecutivos - Terminando")
-                        break
-                    page += 1
-                    
+                    # Estadísticas en tiempo real
+                    elapsed = time.time() - start_time
+                    rate = len(all_coins) / elapsed * 60 if elapsed > 0 else 0
+                    print(f"📊 Total: {len(all_coins):,} | Página {page} | {rate:.0f} cryptos/min")
+                
+                page += 1
+                
+                # Pausa corta para no sobrecargar
+                time.sleep(0.5)
+                
             except KeyboardInterrupt:
-                print("🛑 Scraping interrumpido por el usuario")
+                print("🛑 Interrumpido por usuario")
                 break
             except Exception as e:
-                print(f"❌ Error en página {page}: {e}")
-                consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
-                    break
+                print(f"❌ Error página {page}: {str(e)[:50]}")
+                consecutive_failures += 1
                 page += 1
-                continue
+                time.sleep(1)
         
-        print(f"🎉 Scraping completado. Total: {len(all_coins)} cryptos, Páginas: {page-1}")
+        # Procesar lote final
+        if current_batch:
+            self.db_manager.save_crypto_batch(current_batch)
+        
+        # Estadísticas finales
+        elapsed = time.time() - start_time
+        rate = len(all_coins) / elapsed * 60 if elapsed > 0 else 0
+        
+        print(f"\n🎉 === SCRAPING COMPLETADO ===")
+        print(f"📊 Total extraídas: {len(all_coins):,} cryptos")
+        print(f"📄 Páginas procesadas: {page-1}")
+        print(f"⏱️ Tiempo total: {elapsed:.1f}s")
+        print(f"🚀 Velocidad: {rate:.0f} cryptos/minuto")
+        print(f"💾 Guardado en PostgreSQL normalizado")
         
         return all_coins
     
-    def save_to_csv(self, data, filename='cryptos_coingecko.csv'):
-        """Guarda los datos en CSV de forma optimizada"""
-        try:
-            flattened_data = []
-            for crypto in data:
-                row = {
-                    'name': crypto.get('name', ''),
-                    'symbol': crypto.get('symbol', ''),
-                    'slug': crypto.get('slug', ''),
-                    'rank': crypto.get('rank', 0),
-                    'icon_url': crypto.get('icon_url', ''),
-                    'coin_url': crypto.get('coin_url', ''),
-                    'tags': ','.join(crypto.get('tags', [])),
-                    'source': crypto.get('source', 'coingecko'),
-                }
-                
-                if crypto.get('quote'):
-                    quote = crypto['quote']
-                    row.update({
-                        'price': quote.get('price', 0),
-                        'volume_24h': quote.get('volume_24h', 0),
-                        'market_cap': quote.get('market_cap', 0),
-                        'percent_change_24h': quote.get('percent_change_24h', 0),
-                    })
-                else:
-                    row.update({
-                        'price': 0, 'volume_24h': 0, 'market_cap': 0, 'percent_change_24h': 0
-                    })
-                
-                flattened_data.append(row)
-            
-            df = pd.DataFrame(flattened_data)
-            df.to_csv(filename, index=False, encoding='utf-8')
-            print(f"✅ Datos guardados en {filename}")
-        except Exception as e:
-            print(f"❌ Error guardando CSV: {e}")
-    
-    def save_to_json(self, data, filename='cryptos_coingecko.json'):
-        """Guarda los datos en JSON de forma optimizada"""
-        try:
-            json_data = []
-            for crypto in data:
-                crypto_copy = crypto.copy()
-                
-                # Convertir fechas a strings
-                for field in ['extracted_at']:
-                    if field in crypto_copy and isinstance(crypto_copy[field], datetime):
-                        crypto_copy[field] = crypto_copy[field].isoformat()
-                
-                if crypto_copy.get('quote') and 'last_updated' in crypto_copy['quote']:
-                    if isinstance(crypto_copy['quote']['last_updated'], datetime):
-                        crypto_copy['quote']['last_updated'] = crypto_copy['quote']['last_updated'].isoformat()
-                
-                # Metadatos optimizados
-                crypto_copy['schema_version'] = 'v1'
-                crypto_copy['source_table'] = 'coingecko_cryptos'
-                
-                json_data.append(crypto_copy)
-            
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(json_data, f, ensure_ascii=False, indent=2)
-            print(f"✅ Datos guardados en {filename}")
-        except Exception as e:
-            print(f"❌ Error guardando JSON: {e}")
-    
     def close(self):
-        """Cierra el driver y conexiones"""
-        if self.driver:
-            self.driver.quit()
-            print("🔐 Driver cerrado")
+        """Cerrar recursos"""
+        if hasattr(self, 'driver_pool'):
+            self.driver_pool.close_all()
         
         if self.db_manager:
             self.db_manager.close()
 
 def main():
-    """Función principal optimizada"""
+    """Función principal automatizada - SIN OPCIONES"""
     scraper = None
     
     try:
-        print("🚀 === CoinGecko Scraper Optimizado ===")
-        print("🔥 OPTIMIZACIONES:")
-        print("  - Sin logging verboso")
-        print("  - Driver Chrome optimizado para memoria")
-        print("  - Base de datos con esquema normalizado")
-        print("  - Procesamiento eficiente de páginas")
-        print("  - Delays mínimos para velocidad")
-        print("💾 Base de datos: PostgreSQL optimizado\n")
+        print("🚀 === COINGECKO ULTRA SCRAPER AUTOMÁTICO ===")
+        print("⚡ OPTIMIZACIONES EXTREMAS:")
+        print("  - BeautifulSoup + Selenium híbrido")
+        print("  - Regex precompilados")
+        print("  - Pool de WebDrivers optimizado")
+        print("  - JavaScript completamente desactivado")
+        print("  - Timeouts agresivos")
+        print("  - Parsing ultra rápido")
+        print("  - Scraping automático hasta fallo")
+        print("  - Estructura HTML real de CoinGecko")
         
-        # Cargar variables de entorno
+        # Verificar dependencias
+        check_dependencies()
+        
+        # Cargar configuración
         load_env_file()
-        
-        # Crear configuración
         db_config = DatabaseConfig()
         
-        # Crear scraper optimizado
-        scraper = CoinGeckoScraper(headless=True, delay=0, db_config=db_config)
+        # Crear scraper ultra optimizado
+        scraper = UltraOptimizedScraper(db_config=db_config)
         
-        # Detectar total de criptomonedas
-        print("🔍 Detectando total de criptomonedas...")
-        
-        items_per_page = 250  # Aumentado para menos requests
-        if scraper.get_page(f"{scraper.base_url}/es?page=1&items={items_per_page}"):
-            total_cryptos = scraper.get_total_cryptocurrencies()
-            max_pages = (total_cryptos + items_per_page - 1) // items_per_page
-            
-            print(f"📊 Total detectado: {total_cryptos:,} criptomonedas")
-            print(f"📄 Páginas estimadas: {max_pages}")
-            
-            # Opciones optimizadas
-            print(f"\n🎯 Opciones de scraping:")
-            print(f"1. Todas las páginas ({max_pages} páginas)")
-            print(f"2. Número específico de páginas")
-            print(f"3. Detección automática (recomendado)")
-            print(f"4. Solo primeras 10 páginas (rápido)")
-            
-            choice = input("\nElige una opción (1/2/3/4) [3]: ").strip() or "3"
-            
-            if choice == "1":
-                coins_data = scraper.scrape_pages(max_pages=max_pages, items_per_page=items_per_page)
-            elif choice == "2":
-                try:
-                    custom_pages = int(input(f"Páginas a scrapear (1-{max_pages}): "))
-                    custom_pages = min(max(1, custom_pages), max_pages)
-                    coins_data = scraper.scrape_pages(max_pages=custom_pages, items_per_page=items_per_page)
-                except ValueError:
-                    print("⚠️ Número inválido, usando detección automática")
-                    coins_data = scraper.scrape_pages(items_per_page=items_per_page)
-            elif choice == "4":
-                print("🚀 Scraping rápido - solo primeras 10 páginas")
-                coins_data = scraper.scrape_pages(max_pages=10, items_per_page=items_per_page)
-            else:
-                print("🤖 Detección automática activada")
-                coins_data = scraper.scrape_pages(items_per_page=items_per_page)
-        else:
-            print("❌ No se pudo cargar la primera página")
-            print("🔄 Continuando con detección automática...")
-            coins_data = scraper.scrape_pages(items_per_page=items_per_page)
+        # SCRAPING AUTOMÁTICO - SIN OPCIONES
+        print(f"\n🤖 Iniciando scraping automático...")
+        coins_data = scraper.scrape_all_pages_until_fail()
         
         if coins_data:
-            print(f"\n🎉 === RESULTADOS ===")
-            print(f"Total extraídas: {len(coins_data):,}")
-            print(f"Base de datos: PostgreSQL optimizado")
+            print(f"\n✅ Scraping exitoso:")
+            print(f"📊 {len(coins_data):,} criptomonedas extraídas")
+            print(f"💾 Guardadas en PostgreSQL")
             
-            # Mostrar muestra
-            print(f"\n📊 Primeras 5 criptomonedas:")
-            for i, coin in enumerate(coins_data[:5]):
-                quote_info = ""
-                if coin.get('quote'):
-                    q = coin['quote']
-                    quote_info = f" - ${q['price']:.2f}"
-                
-                print(f"{i+1}. {coin['name']} ({coin['symbol']}){quote_info}")
-            
-            # Preguntar por archivos
-            save_files = input(f"\n💾 ¿Guardar en CSV/JSON? (y/n) [n]: ").strip().lower()
-            if save_files == 'y':
-                scraper.save_to_csv(coins_data)
-                scraper.save_to_json(coins_data)
-                print(f"✅ Archivos guardados")
-            
-            print(f"\n✅ Datos guardados en PostgreSQL optimizado")
+            # Muestra de primeras 5 cryptos
+            if len(coins_data) >= 5:
+                print(f"\n📋 Primeras 5 criptomonedas:")
+                for i, coin in enumerate(coins_data[:5]):
+                    price_str = f" - ${coin['price']:.6f}" if coin.get('price', 0) > 0 else ""
+                    rank_str = f"#{coin.get('rank', i+1)}"
+                    print(f"  {rank_str} {coin['name']} ({coin['symbol']}){price_str}")
             
         else:
-            print("❌ No se pudieron extraer datos")
+            print("❌ No se extrajeron datos")
             
     except KeyboardInterrupt:
         print("🛑 Proceso interrumpido")
     except Exception as e:
         print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         
     finally:
         if scraper:
