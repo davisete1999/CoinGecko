@@ -4,6 +4,7 @@ Script para obtener datos históricos de precios y capitalización de mercado de
 desde CoinGecko usando Selenium. Usa el esquema normalizado de PostgreSQL con tablas separadas
 por fuente y guarda los datos históricos en InfluxDB.
 
+MODIFICADO: Elimina sistema de prioridades - procesa todas las cryptos sin completed_daily
 ARREGLADO: Error de símbolos duplicados en update_coingecko_scraping_progress
 ARREGLADO: Error de conversión int() con valores None - manejo robusto de datos faltantes
 """
@@ -57,7 +58,7 @@ def load_env_file(env_file: str = '.env'):
 class InfluxDBConfig:
     """Configuración de InfluxDB desde variables de entorno"""
     host: str = os.getenv('INFLUXDB_HOST', 'localhost')
-    port: int = int(os.getenv('INFLUXDB_EXTERNAL_PORT') or '8086')  # ARREGLADO: Manejar None
+    port: int = int(os.getenv('INFLUXDB_EXTERNAL_PORT') or '8086')
     database: str = os.getenv('INFLUXDB_DB', 'crypto_historical')
     token: str = os.getenv('INFLUXDB_TOKEN', '0_aEXpz0v0Nhbw-fHpaarS4IEcrktOJjSGFpG9SLMh3tijC8QDyI9ahXfmNnBtQ1sSnIIlGMYqJCo3A6rtF9NQ==')
     org: str = os.getenv('INFLUXDB_ORG', 'CoinAdvisor')
@@ -78,7 +79,7 @@ class InfluxDBConfig:
 class PostgreSQLConfig:
     """Configuración de PostgreSQL desde variables de entorno"""
     host: str = os.getenv('POSTGRES_HOST', 'localhost')
-    port: int = int(os.getenv('POSTGRES_EXTERNAL_PORT') or '5432')  # ARREGLADO: Manejar None
+    port: int = int(os.getenv('POSTGRES_EXTERNAL_PORT') or '5432')
     database: str = os.getenv('POSTGRES_DB', 'cryptodb')
     user: str = os.getenv('POSTGRES_USER', 'crypto-user')
     password: str = os.getenv('POSTGRES_PASSWORD', 'davisete453')
@@ -123,15 +124,15 @@ class PostgreSQLManager:
             print(f"❌ Error conectando a PostgreSQL: {e}")
             return False
     
-    def get_coingecko_cryptocurrencies_with_priority(self, limit: Optional[int] = None) -> List[Dict]:
-        """Obtiene criptomonedas de CoinGecko con priorización inteligente usando esquema normalizado"""
+    def get_pending_coingecko_cryptocurrencies(self, limit: Optional[int] = None) -> List[Dict]:
+        """Obtiene criptomonedas de CoinGecko que no están completadas diariamente"""
         if not self.connection:
             print("❌ No hay conexión a PostgreSQL")
             return []
         
         try:
             with self.connection.cursor() as cursor:
-                # Consulta usando esquema normalizado con vista y joins
+                # Consulta simplificada sin sistema de prioridades
                 sql = """
                 SELECT 
                     c.id as crypto_id,
@@ -162,44 +163,25 @@ class PostgreSQLManager:
                         WHEN cg.last_fetch_attempt IS NOT NULL THEN
                             EXTRACT(DAY FROM (NOW() - cg.last_fetch_attempt))
                         ELSE 999
-                    END as days_since_last_attempt,
-                    
-                    -- Determinar categoría de prioridad
-                    CASE 
-                        WHEN cg.scraping_status = 'pending' THEN 'URGENT'
-                        WHEN cg.scraping_status = 'error' AND cg.fetch_error_count < 3 THEN 'RETRY'
-                        WHEN cg.scraping_status = 'in_progress' AND 
-                             cg.last_fetch_attempt < NOW() - INTERVAL '1 hour' THEN 'STUCK'
-                        WHEN cg.scraping_status = 'completed' AND 
-                             (cg.last_values_update IS NULL OR 
-                              cg.last_values_update < CURRENT_DATE - INTERVAL '7 days') THEN 'UPDATE'
-                        WHEN cg.scraping_status = 'completed' THEN 'CURRENT'
-                        ELSE 'UNKNOWN'
-                    END as priority_category
+                    END as days_since_last_attempt
                     
                 FROM cryptos c
                 INNER JOIN coingecko_cryptos cg ON c.id = cg.crypto_id
                 WHERE c.is_active = true 
                 AND c.slug IS NOT NULL 
                 AND c.slug != ''
+                AND (cg.scraping_status IS NULL OR cg.scraping_status != 'completed_daily')
                 ORDER BY 
-                    -- Prioridad por categoría
+                    -- Ordenar por estado (pendientes primero)
                     CASE 
-                        WHEN cg.scraping_status = 'pending' THEN 1
-                        WHEN cg.scraping_status = 'in_progress' AND 
-                             cg.last_fetch_attempt < NOW() - INTERVAL '1 hour' THEN 2
-                        WHEN cg.scraping_status = 'error' AND cg.fetch_error_count < 3 THEN 3
-                        WHEN cg.scraping_status = 'completed' AND 
-                             (cg.last_values_update IS NULL OR 
-                              cg.last_values_update < CURRENT_DATE - INTERVAL '7 days') THEN 4
-                        WHEN cg.scraping_status = 'completed' THEN 5
-                        ELSE 6
+                        WHEN cg.scraping_status IS NULL OR cg.scraping_status = 'pending' THEN 1
+                        WHEN cg.scraping_status = 'error' THEN 2
+                        WHEN cg.scraping_status = 'in_progress' THEN 3
+                        ELSE 4
                     END,
-                    -- Prioridad secundaria por sistema calculado
-                    cg.next_fetch_priority ASC,
-                    -- Prioridad terciaria por ranking
+                    -- Luego por ranking de CoinGecko
                     cg.coingecko_rank ASC NULLS LAST,
-                    -- Última prioridad alfabética
+                    -- Finalmente alfabéticamente
                     c.symbol ASC
                 """
                 
@@ -211,7 +193,7 @@ class PostgreSQLManager:
                 
                 # Convertir a formato compatible y calcular estadísticas
                 cryptocurrencies = []
-                priority_stats = {'URGENT': 0, 'STUCK': 0, 'RETRY': 0, 'UPDATE': 0, 'CURRENT': 0, 'UNKNOWN': 0}
+                status_stats = {}
                 
                 for row in rows:
                     crypto = {
@@ -226,22 +208,20 @@ class PostgreSQLManager:
                         'badges': row['badges'] or [],
                         'last_values_update': row['last_values_update'],
                         'oldest_data_fetched': row['oldest_data_fetched'],
-                        'scraping_status': row['scraping_status'],
+                        'scraping_status': row['scraping_status'] or 'pending',
                         'total_data_points': row['total_data_points'] or 0,
                         'fetch_error_count': row['fetch_error_count'] or 0,
-                        'priority_category': row['priority_category'],
                         'days_since_last_attempt': int(row['days_since_last_attempt'] or 0),
                         'scraping_notes': row['scraping_notes']
                     }
                     cryptocurrencies.append(crypto)
                     
-                    # Contar estadísticas de prioridad
-                    category = row['priority_category']
-                    if category in priority_stats:
-                        priority_stats[category] += 1
+                    # Contar estadísticas por estado
+                    status = crypto['scraping_status']
+                    status_stats[status] = status_stats.get(status, 0) + 1
                 
-                print(f"✅ Obtenidas {len(cryptocurrencies)} criptomonedas CoinGecko desde PostgreSQL")
-                print(f"📊 Distribución por prioridad: {priority_stats}")
+                print(f"✅ Obtenidas {len(cryptocurrencies)} criptomonedas CoinGecko pendientes desde PostgreSQL")
+                print(f"📊 Distribución por estado: {status_stats}")
                 
                 return cryptocurrencies
                 
@@ -327,7 +307,7 @@ class PostgreSQLManager:
                 params.extend([status])
                 
                 # Campos condicionales según éxito/fallo
-                if status == 'completed':
+                if status == 'completed_daily':
                     update_fields.extend([
                         "fetch_error_count = 0",
                         "total_data_points = %s"
@@ -538,11 +518,11 @@ class InfluxDBManager:
                         continue
                     
                     # Crear punto para InfluxDB con tags específicos de CoinGecko
-                    point = Point("coingecko_historical")
+                    point = Point("crypto_quotes")
                     point.tag("symbol", symbol)
                     point.tag("name", name)
                     point.tag("slug", slug)
-                    point.tag("source", "coingecko_full_historical")
+                    point.tag("source", "coingecko")
                     
                     # ARREGLADO: Tags adicionales específicos de CoinGecko con validación
                     if coingecko_rank is not None:
@@ -734,14 +714,14 @@ class SeleniumCryptoDataScraper:
             raise
     
     def connect_databases(self):
-        """Conectar a PostgreSQL e InfluxDB con verificación de esquema normalizado"""
+        """Conectar a PostgreSQL e InfluxDB"""
         postgres_connected = False
         influx_connected = False
         
         try:
             postgres_connected = self.postgres_manager.connect()
             if postgres_connected:
-                # Mostrar estadísticas iniciales usando vistas del esquema normalizado
+                # Mostrar estadísticas iniciales
                 stats = self.postgres_manager.get_coingecko_scraping_stats()
                 if stats:
                     print("📊 Estado actual scraping CoinGecko:")
@@ -765,12 +745,12 @@ class SeleniumCryptoDataScraper:
         time.sleep(delay)
     
     def load_cryptocurrencies(self) -> List[Dict]:
-        """Carga lista de criptomonedas CoinGecko desde esquema normalizado"""
+        """Carga lista de criptomonedas CoinGecko que no están completadas"""
         try:
-            cryptocurrencies = self.postgres_manager.get_coingecko_cryptocurrencies_with_priority(limit=self.crypto_limit)
+            cryptocurrencies = self.postgres_manager.get_pending_coingecko_cryptocurrencies(limit=self.crypto_limit)
             
             if not cryptocurrencies:
-                print("⚠️ No se encontraron criptomonedas CoinGecko en PostgreSQL")
+                print("⚠️ No se encontraron criptomonedas CoinGecko pendientes en PostgreSQL")
                 print("💡 Intentando cargar desde archivo JSON como respaldo...")
                 
                 # Fallback al archivo JSON si existe
@@ -785,8 +765,7 @@ class SeleniumCryptoDataScraper:
                                 'simbolo': crypto.get('simbolo', ''),
                                 'enlace': crypto.get('enlace', ''),
                                 'slug': crypto.get('enlace', '').split('/')[-1] if crypto.get('enlace') else '',
-                                'scraping_status': 'pending',
-                                'priority_category': 'URGENT'
+                                'scraping_status': 'pending'
                             }
                             cryptocurrencies.append(adapted)
                         
@@ -924,32 +903,31 @@ class SeleniumCryptoDataScraper:
             print(f"❌ Error al guardar respaldo JSON para {symbol}: {e}")
             return False
     
-    def process_cryptocurrency_normalized(self, crypto: Dict) -> bool:
-        """Procesa criptomoneda usando esquema normalizado"""
+    def process_cryptocurrency(self, crypto: Dict) -> bool:
+        """Procesa criptomoneda individual"""
         symbol = crypto.get('simbolo', '').upper()
         enlace = crypto.get('enlace', '')
         nombre = crypto.get('nombre', '')
-        priority_category = crypto.get('priority_category', 'UNKNOWN')
         current_status = crypto.get('scraping_status', 'pending')
         error_count = crypto.get('fetch_error_count', 0)
-        crypto_id = crypto.get('crypto_id')  # IMPORTANTE: Obtener crypto_id
+        crypto_id = crypto.get('crypto_id')
         
         if not symbol or not enlace:
             print(f"⚠️ Datos incompletos para {nombre}")
             return False
         
-        print(f"\n📊 Procesando {nombre} ({symbol}) - Prioridad: {priority_category}")
+        print(f"\n📊 Procesando {nombre} ({symbol})")
         print(f"🔄 Estado actual: {current_status} | Errores: {error_count} | ID: {crypto_id}")
         
         start_time = time.time()
         
-        # ARREGLADO: Marcar como en progreso usando crypto_id cuando esté disponible
+        # Marcar como en progreso
         self.postgres_manager.update_coingecko_scraping_progress(
             crypto_id=crypto_id,
             symbol=symbol,
             name=nombre,
             status='in_progress',
-            notes=f'Iniciando descarga histórica (prioridad: {priority_category})'
+            notes='Iniciando descarga histórica'
         )
         
         # Extraer nombre de URL
@@ -963,7 +941,6 @@ class SeleniumCryptoDataScraper:
                 print(f"❌ No se pudieron obtener datos de precios para {symbol}")
                 duration = int(time.time() - start_time)
                 
-                # ARREGLADO: Usar crypto_id en la actualización
                 self.postgres_manager.update_coingecko_scraping_progress(
                     crypto_id=crypto_id,
                     symbol=symbol,
@@ -990,7 +967,6 @@ class SeleniumCryptoDataScraper:
                 print(f"❌ No hay datos combinados para {symbol}")
                 duration = int(time.time() - start_time)
                 
-                # ARREGLADO: Usar crypto_id en la actualización
                 self.postgres_manager.update_coingecko_scraping_progress(
                     crypto_id=crypto_id,
                     symbol=symbol,
@@ -1001,7 +977,7 @@ class SeleniumCryptoDataScraper:
                 
                 return False
             
-            # Guardar en InfluxDB con esquema específico de CoinGecko
+            # Guardar en InfluxDB
             influx_result = {'success': False, 'points_saved': 0}
             if self.influx_manager.write_api:
                 influx_result = self.influx_manager.save_coingecko_historical_data(crypto, combined_data)
@@ -1011,13 +987,13 @@ class SeleniumCryptoDataScraper:
             
             duration = int(time.time() - start_time)
             
-            # ARREGLADO: Actualizar estado en PostgreSQL con información detallada usando crypto_id
+            # Actualizar estado en PostgreSQL
             if influx_result.get('success'):
                 self.postgres_manager.update_coingecko_scraping_progress(
                     crypto_id=crypto_id,
                     symbol=symbol, 
                     name=nombre,
-                    status='completed',
+                    status='completed_daily',
                     total_points=influx_result['points_saved'],
                     oldest_date=influx_result.get('oldest_date'),
                     latest_date=influx_result.get('latest_date'),
@@ -1029,7 +1005,6 @@ class SeleniumCryptoDataScraper:
                 print(f"📅 Rango: {influx_result.get('oldest_date')} → {influx_result.get('latest_date')}")
             else:
                 error_msg = influx_result.get('error', 'Unknown error')
-                # ARREGLADO: Usar crypto_id en la actualización de error
                 self.postgres_manager.update_coingecko_scraping_progress(
                     crypto_id=crypto_id,
                     symbol=symbol,
@@ -1047,7 +1022,6 @@ class SeleniumCryptoDataScraper:
             error_msg = str(e)[:200]
             
             print(f"❌ Error procesando {symbol}: {e}")
-            # ARREGLADO: Usar crypto_id en la actualización de error
             self.postgres_manager.update_coingecko_scraping_progress(
                 crypto_id=crypto_id,
                 symbol=symbol,
@@ -1059,9 +1033,9 @@ class SeleniumCryptoDataScraper:
             return False
     
     def run(self) -> None:
-        """Ejecuta el proceso completo usando esquema normalizado"""
+        """Ejecuta el proceso completo"""
         
-        print(f"🚀 Iniciando scraper CoinGecko con esquema normalizado (VERSIÓN ARREGLADA - None values)")
+        print(f"🚀 Iniciando scraper CoinGecko - Solo cryptos pendientes (sin completed_daily)")
         
         # Conectar a bases de datos
         postgres_connected, influx_connected = self.connect_databases()
@@ -1075,14 +1049,15 @@ class SeleniumCryptoDataScraper:
         else:
             print("⚠️ InfluxDB no disponible - Solo se guardarán respaldos JSON y estados en PostgreSQL")
         
-        # Cargar criptomonedas CoinGecko desde esquema normalizado
+        # Cargar criptomonedas pendientes
         cryptocurrencies = self.load_cryptocurrencies()
         
         if not cryptocurrencies:
-            print("❌ No se encontraron criptomonedas CoinGecko para procesar")
+            print("❌ No se encontraron criptomonedas CoinGecko pendientes para procesar")
+            print("💡 Todas las cryptos pueden ya estar completadas (completed_daily)")
             return
         
-        print(f"📊 Procesando {len(cryptocurrencies)} criptomonedas CoinGecko con priorización")
+        print(f"📊 Procesando {len(cryptocurrencies)} criptomonedas CoinGecko pendientes")
         if self.crypto_limit:
             print(f"🔢 Límite aplicado: {self.crypto_limit} criptomonedas")
         
@@ -1091,26 +1066,17 @@ class SeleniumCryptoDataScraper:
         # Estadísticas de ejecución
         successful = 0
         failed = 0
-        skipped = 0
         total_points_saved = 0
         
         try:
             for i, crypto in enumerate(cryptocurrencies, 1):
-                priority = crypto.get('priority_category', 'UNKNOWN')
                 status = crypto.get('scraping_status', 'unknown')
                 
-                print(f"\n[{i}/{len(cryptocurrencies)}] {priority} | {status} ", end="")
+                print(f"\n[{i}/{len(cryptocurrencies)}] Estado: {status}")
                 
                 try:
-                    # Decidir si procesar según prioridad
-                    if priority == 'CURRENT' and status == 'completed':
-                        print(f"⏭️ Saltando {crypto.get('simbolo')} - Ya está actualizado")
-                        skipped += 1
-                        continue
-                    
-                    if self.process_cryptocurrency_normalized(crypto):
+                    if self.process_cryptocurrency(crypto):
                         successful += 1
-                        # Estimar puntos guardados basado en respuesta
                         total_points_saved += crypto.get('total_data_points', 0)
                     else:
                         failed += 1
@@ -1132,7 +1098,6 @@ class SeleniumCryptoDataScraper:
         print(f"\n\n📈 === RESUMEN FINAL ===")
         print(f"✅ Exitosos: {successful}")
         print(f"❌ Fallidos: {failed}")
-        print(f"⏭️ Saltados: {skipped}")
         print(f"📊 Estados actualizados en PostgreSQL (esquema normalizado)")
         
         if influx_connected:
@@ -1140,7 +1105,7 @@ class SeleniumCryptoDataScraper:
         
         print(f"📁 Respaldos JSON en: {os.path.abspath(self.output_dir)}")
         
-        # Mostrar estadísticas finales usando vistas del esquema normalizado
+        # Mostrar estadísticas finales
         final_stats = self.postgres_manager.get_coingecko_scraping_stats()
         if final_stats:
             print(f"\n📊 === ESTADO FINAL SCRAPING COINGECKO ===")
@@ -1165,8 +1130,8 @@ def main():
     scraper = None
     
     try:
-        print("🚀 === CoinGecko Historical Scraper (ARREGLADO - None values + duplicados) ===")
-        print("Con tracking avanzado y separación por fuentes de datos")
+        print("🚀 === CoinGecko Historical Scraper (SIN Sistema de Prioridades) ===")
+        print("Procesa todas las cryptos que NO tienen scraping_status = 'completed_daily'")
         print("CORRECCIÓN: Resuelto error de símbolos duplicados usando crypto_id")
         print("CORRECCIÓN: Manejo robusto de valores None en conversiones numéricas")
         print("Instalando dependencias:")
